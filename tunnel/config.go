@@ -34,6 +34,7 @@ func NewSSHConfigFile(configPath string) (*SSHConfigFile, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
 
 	cfg, err := ssh_config.Decode(f)
 	if err != nil {
