@@ -911,7 +911,15 @@ func prepareTestEnv() error {
 		},
 	}
 
-	err := os.Mkdir(testDir, os.ModeDir|os.ModePerm)
+	// the directory is entirely generated from the fixtures, and a test run
+	// that died before cleaning up would otherwise keep every later run from
+	// starting at all
+	err := os.RemoveAll(testDir)
+	if err != nil {
+		return err
+	}
+
+	err = os.Mkdir(testDir, os.ModeDir|os.ModePerm)
 	if err != nil {
 		return err
 	}
@@ -999,7 +1007,15 @@ func createSSHServer(t *testing.T, address string, keyPath string) (net.Listener
 				break
 			}
 
-			serverConn, chans, reqs, _ := ssh.NewServerConn(conn, conf)
+			serverConn, chans, reqs, err := ssh.NewServerConn(conn, conf)
+			if err != nil {
+				// the client gave up in the middle of the handshake, which is
+				// what happens to a tunnel reconnecting to a server that is
+				// being taken down by a test
+				conn.Close()
+				continue
+			}
+
 			conns = append(conns, serverConn)
 
 			// go routine to handle ssh client requests. In the context of mole's test,
@@ -1058,8 +1074,21 @@ func createSSHServer(t *testing.T, address string, keyPath string) (net.Listener
 						remoteIP := string(payload[pad : pad+l])
 						remotePort := binary.BigEndian.Uint32(payload[pad+l : pad+l+4])
 
-						conn, _, _ := newChan.Accept()
-						remoteConn, _ := net.Dial("tcp", net.JoinHostPort(remoteIP, strconv.FormatUint(uint64(remotePort), 10)))
+						// a channel opened while the connection is being taken
+						// down can't be accepted, and neither the channel nor
+						// the connection to the endpoint can be used before
+						// knowing they are there: using them regardless takes
+						// the whole test binary down with a nil dereference
+						conn, _, err := newChan.Accept()
+						if err != nil {
+							return
+						}
+
+						remoteConn, err := net.Dial("tcp", net.JoinHostPort(remoteIP, strconv.FormatUint(uint64(remotePort), 10)))
+						if err != nil {
+							conn.Close()
+							return
+						}
 
 						go func() {
 							io.Copy(conn, remoteConn)
