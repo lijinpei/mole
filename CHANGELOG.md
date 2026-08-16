@@ -5,6 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- Support for multiple defined forwards in the SSH config file [#185]
+
+### Fixed
+- Detached instances no longer lose the last two command line arguments. The id
+  argument was written over them instead of after them, so `start alias <name>
+  --detach` reached the child process without the alias name and
+  `start local --server <host> --detach` without the server
+- `start alias` accepts the hidden `--id` flag, without which a detached
+  instance failed to start [#184]
+- An alias with no `ssh-config` set no longer overrides the value given through
+  the `--config` flag [#192]
+- Close the SSH config file after reading it [#198]
+- Bump `tzinfo`, `activesupport` and `nokogiri` used to build the documentation
+  site [#190] [#194] [#196]
+
 ### Changed
 - Bump all dependencies to their latest versions, which raises the minimum Go version to 1.25
 - Replace the archived `github.com/mitchellh/mapstructure` with the maintained `github.com/go-viper/mapstructure/v2`

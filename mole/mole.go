@@ -506,16 +506,18 @@ func createTunnel(conf *Configuration) (*tunnel.Tunnel, error) {
 // This is helpful for scenarios where the process will be detached from the
 // parent process and the new child process needs context about the instance.
 func appendIdArg(id string, args []string) (newArgs []string) {
+	idFlag := fmt.Sprintf("--%s", IdFlagName)
+
 	for _, arg := range args {
-		if arg == "--id" {
+		if arg == idFlag {
 			return args
 		}
 	}
 
 	newArgs = make([]string, len(args)+2)
 	copy(newArgs, args)
-	newArgs[len(args)-2] = fmt.Sprintf("--%s", IdFlagName)
-	newArgs[len(args)-1] = id
+	newArgs[len(args)] = idFlag
+	newArgs[len(args)+1] = id
 
 	return
 }
