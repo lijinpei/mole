@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
@@ -653,7 +654,7 @@ func createSSHServer(t *testing.T, address string, keyPath string) (net.Listener
 						remotePort := binary.BigEndian.Uint32(payload[pad+l : pad+l+4])
 
 						conn, _, _ := newChan.Accept()
-						remoteConn, _ := net.Dial("tcp", fmt.Sprintf("%s:%d", remoteIP, remotePort))
+						remoteConn, _ := net.Dial("tcp", net.JoinHostPort(remoteIP, strconv.FormatUint(uint64(remotePort), 10)))
 
 						go func() {
 							io.Copy(conn, remoteConn)

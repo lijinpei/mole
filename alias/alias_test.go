@@ -139,7 +139,7 @@ func addAlias() (*alias.Alias, error) {
 	return a, nil
 }
 
-//setup prepares the system environment to run the tests by:
+// setup prepares the system environment to run the tests by:
 // 1. Create temp dir and <dir>/.mole
 // 2. Copy fixtures to <dir>/.mole
 // 3. Set temp dir as the user testDir dir

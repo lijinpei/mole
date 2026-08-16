@@ -179,7 +179,7 @@ func Get(aliasName string) (*Alias, error) {
 	return a, nil
 }
 
-//FIXME terrible struct name. Change it.
+// FIXME terrible struct name. Change it.
 type aliases struct {
 	Aliases map[string]*Alias `toml:"aliases"`
 }

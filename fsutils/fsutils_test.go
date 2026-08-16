@@ -103,13 +103,13 @@ func TestLogFileLocation(t *testing.T) {
 	instanceId := "id"
 	instanceDir, err := fsutils.InstanceDir(instanceId)
 	if err != nil {
-		t.Errorf("%w", err)
+		t.Errorf("%v", err)
 	}
 
 	expected := filepath.Join(instanceDir.Dir, fsutils.InstanceLogFile)
 	lfp, err := fsutils.GetLogFileLocation(instanceId)
 	if err != nil {
-		t.Errorf("%w", err)
+		t.Errorf("%v", err)
 	}
 
 	if lfp != expected {
@@ -153,7 +153,7 @@ func TestMain(m *testing.M) {
 
 }
 
-//setup prepares the system environment to run the tests by:
+// setup prepares the system environment to run the tests by:
 // 1. Create temp dir and <dir>/.mole
 // 2. Copy fixtures to <dir>/.mole
 // 3. Set temp dir as the user testDir dir
