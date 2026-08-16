@@ -127,7 +127,6 @@ type SSHChannel struct {
 	Source      string
 	Destination string
 	listener    net.Listener
-	conn        net.Conn
 }
 
 // Listen creates tcp listeners for each channel defined.
@@ -158,15 +157,15 @@ func (ch *SSHChannel) Listen(serverClient *ssh.Client) error {
 	return nil
 }
 
-// Accept waits for and return the next connection to the SSHChannel.
-func (ch *SSHChannel) Accept() error {
-	var err error
-
-	if ch.conn, err = ch.listener.Accept(); err != nil {
-		return fmt.Errorf("error while establishing connection: %v", err)
+// Accept waits for and returns the next connection to the SSHChannel. The
+// caller owns the returned connection and is responsible for closing it.
+func (ch *SSHChannel) Accept() (net.Conn, error) {
+	conn, err := ch.listener.Accept()
+	if err != nil {
+		return nil, fmt.Errorf("error while establishing connection: %v", err)
 	}
 
-	return nil
+	return conn, nil
 }
 
 // String returns a string representation of a SSHChannel
@@ -281,9 +280,7 @@ func (t *Tunnel) Listen() error {
 }
 
 func (t *Tunnel) startChannel(channel *SSHChannel) error {
-	var err error
-
-	err = channel.Accept()
+	conn, err := channel.Accept()
 	if err != nil {
 		return err
 	}
@@ -310,8 +307,8 @@ func (t *Tunnel) startChannel(channel *SSHChannel) error {
 		return fmt.Errorf("dial error: %s", err)
 	}
 
-	go copyConn(channel.conn, destinationConn)
-	go copyConn(destinationConn, channel.conn)
+	go copyConn(conn, destinationConn)
+	go copyConn(destinationConn, conn)
 
 	log.WithFields(log.Fields{
 		"channel": channel,
