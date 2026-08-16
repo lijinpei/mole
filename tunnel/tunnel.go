@@ -205,10 +205,14 @@ type Tunnel struct {
 	// server
 	WaitAndRetry time.Duration
 
-	server        *Server
-	channels      []*SSHChannel
-	done          chan error
+	server   *Server
+	channels []*SSHChannel
+	done     chan error
+	// client is replaced on every reconnection while the goroutines serving
+	// the channels keep running, so it must only be reached through
+	// sshClient and setSSHClient.
 	client        *ssh.Client
+	clientMutex   sync.RWMutex
 	stopKeepAlive chan bool
 	reconnect     chan error
 	// stop is closed when the tunnel is shutting down, telling the channel
@@ -244,6 +248,23 @@ func New(tunnelType string, server *Server, source, destination []string, config
 	}, nil
 }
 
+// sshClient returns the connection to the ssh server currently in use, which
+// is nil while the tunnel has none.
+func (t *Tunnel) sshClient() *ssh.Client {
+	t.clientMutex.RLock()
+	defer t.clientMutex.RUnlock()
+
+	return t.client
+}
+
+// setSSHClient sets the connection to the ssh server to be used from now on.
+func (t *Tunnel) setSSHClient(client *ssh.Client) {
+	t.clientMutex.Lock()
+	defer t.clientMutex.Unlock()
+
+	t.client = client
+}
+
 // Start creates the ssh tunnel and initialized all channels allowing data
 // exchange between local and remote enpoints.
 func (t *Tunnel) Start() error {
@@ -258,7 +279,10 @@ func (t *Tunnel) Start() error {
 				log.WithError(err).Warnf("reconnecting to ssh server")
 
 				t.stopKeepAlive <- true
-				t.client.Close()
+
+				if client := t.sshClient(); client != nil {
+					client.Close()
+				}
 
 				log.Debugf("restablishing the tunnel after disconnection: %s", t)
 
@@ -282,9 +306,9 @@ func (t *Tunnel) Start() error {
 			// they must be closed before the ssh client.
 			t.closeChannels()
 
-			if t.client != nil {
+			if client := t.sshClient(); client != nil {
 				t.stopKeepAlive <- true
-				t.client.Close()
+				client.Close()
 			}
 
 			return err
@@ -294,8 +318,10 @@ func (t *Tunnel) Start() error {
 
 // Listen creates tcp listeners for each channel defined.
 func (t *Tunnel) Listen() error {
+	client := t.sshClient()
+
 	for _, ch := range t.channels {
-		if err := ch.Listen(t.client); err != nil {
+		if err := ch.Listen(client); err != nil {
 			return err
 		}
 	}
@@ -328,14 +354,15 @@ func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn) error {
 		"channel": channel,
 	}).Debug("connection established")
 
-	if t.client == nil {
+	client := t.sshClient()
+	if client == nil {
 		return fmt.Errorf("tunnel channel can't be established: missing connection to the ssh server")
 	}
 
 	var destinationConn net.Conn
 
 	if t.Type == "local" {
-		destinationConn, err = t.client.Dial("tcp", channel.Destination)
+		destinationConn, err = client.Dial("tcp", channel.Destination)
 	} else if t.Type == "remote" {
 		destinationConn, err = net.Dial("tcp", channel.Destination)
 	} else {
@@ -358,24 +385,27 @@ func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn) error {
 }
 
 // Stop cancels the tunnel, closing all connections.
-func (t Tunnel) Stop() {
+func (t *Tunnel) Stop() {
 	t.done <- nil
 }
 
 // String returns a string representation of a Tunnel.
-func (t Tunnel) String() string {
+func (t *Tunnel) String() string {
 	return fmt.Sprintf("[channels:%s, server:%s]", t.channels, t.server.Address)
 }
 
 func (t *Tunnel) dial() error {
-	if t.client != nil {
-		t.client.Close()
+	if client := t.sshClient(); client != nil {
+		client.Close()
+		t.setSSHClient(nil)
 	}
 
 	c, err := sshClientConfig(*t.server)
 	if err != nil {
 		return fmt.Errorf("error generating ssh client config: %s", err)
 	}
+
+	var client *ssh.Client
 
 	retries := 0
 	for {
@@ -388,7 +418,7 @@ func (t *Tunnel) dial() error {
 			return fmt.Errorf("error while connecting to ssh server")
 		}
 
-		t.client, err = ssh.Dial("tcp", t.server.Address, c)
+		client, err = ssh.Dial("tcp", t.server.Address, c)
 		if err != nil {
 			log.WithError(err).WithFields(log.Fields{
 				"server":  t.server,
@@ -408,10 +438,15 @@ func (t *Tunnel) dial() error {
 		break
 	}
 
-	go t.keepAlive()
+	t.setSSHClient(client)
+
+	// both goroutines below are bound to the connection just established, so
+	// they are given it instead of reaching for whatever connection the tunnel
+	// happens to be using by the time they run.
+	go t.keepAlive(client)
 
 	if t.ConnectionRetries > 0 {
-		go t.waitAndReconnect()
+		go t.waitAndReconnect(client)
 	}
 
 	log.WithFields(log.Fields{
@@ -421,8 +456,8 @@ func (t *Tunnel) dial() error {
 	return nil
 }
 
-func (t *Tunnel) waitAndReconnect() {
-	t.reconnect <- t.client.Wait()
+func (t *Tunnel) waitAndReconnect(client *ssh.Client) {
+	t.reconnect <- client.Wait()
 }
 
 func (t *Tunnel) connect() {
@@ -499,15 +534,23 @@ func (t *Tunnel) connect() {
 
 }
 
-func (t *Tunnel) keepAlive() {
+func (t *Tunnel) keepAlive(client *ssh.Client) {
 	ticker := time.NewTicker(t.KeepAliveInterval)
+	defer ticker.Stop()
 
 	log.Debug("start sending keep alive packets")
 
 	for {
 		select {
 		case <-ticker.C:
-			_, _, err := t.client.SendRequest("keepalive@mole", true, nil)
+			if client == nil {
+				// dial gave up on connecting to the ssh server, so there is
+				// nothing to keep alive. The goroutine is kept around anyway to
+				// consume the stop message meant for it.
+				continue
+			}
+
+			_, _, err := client.SendRequest("keepalive@mole", true, nil)
 			if err != nil {
 				log.Warnf("error sending keep-alive request to ssh server: %v", err)
 			}
