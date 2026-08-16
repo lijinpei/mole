@@ -239,11 +239,17 @@ func (ch *SSHChannel) String() string {
 
 // Tunnel represents the ssh tunnel and the channels connecting local and
 // remote endpoints.
+//
+// A Tunnel can only be started once: stopping it releases the source endpoints
+// of its channels and the connection to the ssh server for good.
 type Tunnel struct {
 	// Type tells what kind of port forwarding this tunnel will handle: local or remote
 	Type string
 
-	// Ready tells when the Tunnel is ready to accept connections
+	// Ready tells when the Tunnel is ready to accept connections, which is as
+	// soon as its channels are listening on their source endpoints. A new
+	// message is sent every time the tunnel reconnects to the ssh server, and
+	// dropped whenever the previous one has not been consumed.
 	Ready chan bool
 
 	// KeepAliveInterval is the time period used to send keep alive packets to
@@ -269,7 +275,8 @@ type Tunnel struct {
 	reconnect   chan error
 	// stop is closed when the tunnel is shutting down, telling the channel
 	// goroutines that any error they get from that point on is expected.
-	stop chan struct{}
+	stop     chan struct{}
+	stopOnce sync.Once
 }
 
 // New creates a new instance of Tunnel.
@@ -319,6 +326,10 @@ func (t *Tunnel) setSSHClient(client *ssh.Client) {
 // Start creates the ssh tunnel and initialized all channels allowing data
 // exchange between local and remote enpoints.
 func (t *Tunnel) Start() error {
+	if t.stopping() {
+		return fmt.Errorf("tunnel has been stopped and can't be started again")
+	}
+
 	log.Debugf("tunnel: %s", t)
 
 	t.connect()
@@ -365,7 +376,9 @@ func (t *Tunnel) shutdown(err error) error {
 	// signal the shutdown before closing the listeners so the channel
 	// goroutines know the errors they are about to get from Accept are
 	// expected.
-	close(t.stop)
+	t.stopOnce.Do(func() {
+		close(t.stop)
+	})
 
 	// the listeners of remote channels live on the ssh connection, so they must
 	// be closed before the ssh client.

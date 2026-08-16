@@ -237,6 +237,42 @@ func TestTunnelStopReleasesSourceEndpoints(t *testing.T) {
 	}
 }
 
+// Stopping a tunnel gives up the source endpoints and the connection to the
+// ssh server for good, so it can't be started again.
+func TestTunnelCannotBeStartedAgain(t *testing.T) {
+	c := &tunnelConfig{t, "local", 1, false, NoSshRetries}
+	tun, _, started := prepareTunnel(c)
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(1 * time.Second):
+		t.Errorf("error waiting for tunnel to be ready")
+		return
+	}
+
+	tun.Stop()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Errorf("the tunnel never stopped")
+		return
+	}
+
+	restarted := make(chan error, 1)
+	go func() { restarted <- tun.Start() }()
+
+	select {
+	case err := <-restarted:
+		if err == nil {
+			t.Errorf("a tunnel that has been stopped should not be able to start again")
+		}
+	case <-time.After(2 * time.Second):
+		t.Errorf("a tunnel that has been stopped should not be able to start again")
+	}
+}
+
 // waitForClosedEndpoint waits until no connection can be established to the
 // given address anymore, returning an error if that does not happen within the
 // given timeout.
