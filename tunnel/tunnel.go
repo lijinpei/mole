@@ -278,45 +278,66 @@ func (t *Tunnel) Start() error {
 	for {
 		select {
 		case err := <-t.reconnect:
-			if err != nil {
-				log.WithError(err).Warnf("reconnecting to ssh server")
-
-				t.stopKeepAlive <- true
-
-				if client := t.sshClient(); client != nil {
-					client.Close()
-				}
-
-				log.Debugf("restablishing the tunnel after disconnection: %s", t)
-
-				// The reconnecion must happens on a goroutine to support the scenario
-				// where tunnel.Stop() is called while the tunnel.connect() is getting
-				// executed.
-				//
-				// In an event where tunnel.reconnect receives data from any point of the
-				// code rather than tunnel.dial(), which is evoked by tunnel.connect()
-				// this code needs to be updated to make sure tunnel.connect() is not
-				// schedule in two goroutines at the same time.
-				go t.connect()
+			if err == nil {
+				continue
 			}
-		case err := <-t.done:
-			// signal the shutdown before closing the listeners so the channel
-			// goroutines know the errors they are about to get from Accept are
-			// expected.
-			close(t.stop)
 
-			// the listeners of remote channels live on the ssh connection, so
-			// they must be closed before the ssh client.
-			t.closeChannels()
+			if t.reconnectionDisabled() {
+				log.WithError(err).Error("connection to the ssh server is gone and reconnection is disabled")
+
+				return t.shutdown(err)
+			}
+
+			log.WithError(err).Warnf("reconnecting to ssh server")
+
+			t.stopKeepAlive <- true
 
 			if client := t.sshClient(); client != nil {
-				t.stopKeepAlive <- true
 				client.Close()
 			}
 
-			return err
+			log.Debugf("restablishing the tunnel after disconnection: %s", t)
+
+			// The reconnecion must happens on a goroutine to support the scenario
+			// where tunnel.Stop() is called while the tunnel.connect() is getting
+			// executed.
+			//
+			// In an event where tunnel.reconnect receives data from any point of the
+			// code rather than tunnel.dial(), which is evoked by tunnel.connect()
+			// this code needs to be updated to make sure tunnel.connect() is not
+			// schedule in two goroutines at the same time.
+			go t.connect()
+		case err := <-t.done:
+			return t.shutdown(err)
 		}
 	}
+}
+
+// shutdown tears down everything the tunnel has created, returning the error
+// that caused it to stop, if any.
+func (t *Tunnel) shutdown(err error) error {
+	// signal the shutdown before closing the listeners so the channel
+	// goroutines know the errors they are about to get from Accept are
+	// expected.
+	close(t.stop)
+
+	// the listeners of remote channels live on the ssh connection, so they must
+	// be closed before the ssh client.
+	t.closeChannels()
+
+	if client := t.sshClient(); client != nil {
+		t.stopKeepAlive <- true
+		client.Close()
+	}
+
+	return err
+}
+
+// reconnectionDisabled tells whether the tunnel should give up on the ssh
+// server as soon as it cannot be reached, which is what a negative number of
+// connection retries asks for.
+func (t *Tunnel) reconnectionDisabled() bool {
+	return t.ConnectionRetries < 0
 }
 
 // Listen creates tcp listeners for each channel defined.
@@ -428,8 +449,8 @@ func (t *Tunnel) dial() error {
 				"retries": retries,
 			}).Error("error while connecting to ssh server")
 
-			if t.ConnectionRetries < 0 {
-				break
+			if t.reconnectionDisabled() {
+				return fmt.Errorf("error while connecting to ssh server: %v", err)
 			}
 
 			retries = retries + 1
@@ -446,11 +467,12 @@ func (t *Tunnel) dial() error {
 	// both goroutines below are bound to the connection just established, so
 	// they are given it instead of reaching for whatever connection the tunnel
 	// happens to be using by the time they run.
+	//
+	// The connection is watched whatever the retry configuration is: the tunnel
+	// can only forward anything while it is up, so its loss either starts a
+	// reconnection or ends the tunnel.
 	go t.keepAlive(client)
-
-	if t.ConnectionRetries > 0 {
-		go t.waitAndReconnect(client)
-	}
+	go t.waitAndReconnect(client)
 
 	log.WithFields(log.Fields{
 		"server": t.server,
@@ -549,13 +571,6 @@ func (t *Tunnel) keepAlive(client *ssh.Client) {
 	for {
 		select {
 		case <-ticker.C:
-			if client == nil {
-				// dial gave up on connecting to the ssh server, so there is
-				// nothing to keep alive. The goroutine is kept around anyway to
-				// consume the stop message meant for it.
-				continue
-			}
-
 			_, _, err := client.SendRequest("keepalive@mole", true, nil)
 			if err != nil {
 				log.Warnf("error sending keep-alive request to ssh server: %v", err)

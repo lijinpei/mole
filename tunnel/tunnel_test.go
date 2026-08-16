@@ -360,6 +360,128 @@ func TestReconnectReusesChannelGoroutines(t *testing.T) {
 	tun.Stop()
 }
 
+// A negative number of connection retries asks the tunnel to give up on the
+// ssh server as soon as it cannot be reached, which must be reported instead
+// of leaving a tunnel behind that can't forward anything.
+func TestTunnelFailsToStartWhenReconnectionIsDisabled(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Errorf("could not reserve an address for the test: %v", err)
+		return
+	}
+	address := l.Addr().String()
+	l.Close()
+
+	srv, err := NewServer("mole", address, "", "", "testdata/.ssh/config")
+	if err != nil {
+		t.Errorf("could not create server: %v", err)
+		return
+	}
+	srv.Insecure = true
+	srv.Timeout = 1 * time.Second
+
+	hl, _ := createHttpServer()
+
+	tun, err := New("local", srv, []string{"127.0.0.1:0"}, []string{hl.Addr().String()}, configPath)
+	if err != nil {
+		t.Errorf("could not create tunnel: %v", err)
+		return
+	}
+	tun.ConnectionRetries = NoSshRetries
+	tun.WaitAndRetry = 100 * time.Millisecond
+	tun.KeepAliveInterval = 100 * time.Millisecond
+
+	started := make(chan error, 1)
+	go func() { started <- tun.Start() }()
+
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Errorf("the tunnel should not have started without a connection to the ssh server")
+		}
+	case <-time.After(5 * time.Second):
+		t.Errorf("the tunnel should have given up on the ssh server instead of waiting for connections it can't forward")
+	}
+}
+
+// A negative number of connection retries also means the tunnel must stop as
+// soon as the connection it is using is lost.
+func TestTunnelStopsWhenReconnectionIsDisabled(t *testing.T) {
+	c := &tunnelConfig{t, "local", 1, false, NoSshRetries}
+	tun, ssh, started := prepareTunnel(c)
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(1 * time.Second):
+		t.Errorf("error waiting for tunnel to be ready")
+		return
+	}
+
+	err := validateTunnelConnectivity(t, "ABC", tun)
+	if err != nil {
+		t.Errorf("%v", err)
+		return
+	}
+
+	ssh.Close()
+
+	select {
+	case err := <-started:
+		if err == nil {
+			t.Errorf("the tunnel should have reported the loss of the connection to the ssh server")
+		}
+	case <-time.After(5 * time.Second):
+		t.Errorf("the tunnel should have stopped after losing the connection to the ssh server")
+	}
+}
+
+// Zero connection retries asks the tunnel to never give up on the ssh server.
+func TestTunnelNeverGivesUpReconnecting(t *testing.T) {
+	c := &tunnelConfig{t, "local", 1, false, 0}
+	tun, ssh, started := prepareTunnel(c)
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(1 * time.Second):
+		t.Errorf("error waiting for tunnel to be ready")
+		return
+	}
+
+	err := validateTunnelConnectivity(t, "ABC", tun)
+	if err != nil {
+		t.Errorf("%v", err)
+		return
+	}
+
+	ssh.Close()
+
+	_, err = createSSHServer(t, ssh.Addr().String(), keyPath)
+	if err != nil {
+		t.Errorf("error while recreating ssh server: %s", err)
+		return
+	}
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case err := <-started:
+		t.Errorf("the tunnel should have kept trying to reconnect, but it stopped: %v", err)
+		return
+	case <-time.After(10 * time.Second):
+		t.Errorf("the tunnel never reconnected to the ssh server")
+		return
+	}
+
+	err = validateTunnelConnectivity(t, "GHJ", tun)
+	if err != nil {
+		t.Errorf("%v", err)
+	}
+
+	tun.Stop()
+}
+
 // countAcceptGoroutines returns the number of goroutines currently accepting
 // connections on behalf of a tunnel channel.
 func countAcceptGoroutines() int {
@@ -547,9 +669,7 @@ type tunnelConfig struct {
 //
 // The 'remotes' argument tells how many remote endpoints will be available
 // through the tunnel.
-func prepareTunnel(config *tunnelConfig) (tun *Tunnel, ssh net.Listener, hss []*http.Server) {
-	hss = make([]*http.Server, config.Destinations)
-
+func prepareTunnel(config *tunnelConfig) (tun *Tunnel, ssh net.Listener, started <-chan error) {
 	ssh, err := createSSHServer(config.T, "", keyPath)
 	if err != nil {
 		config.T.Errorf("error while creating ssh server: %s", err)
@@ -573,7 +693,7 @@ func prepareTunnel(config *tunnelConfig) (tun *Tunnel, ssh net.Listener, hss []*
 	destination := make([]string, config.Destinations)
 
 	for i := 0; i <= (config.Destinations - 1); i++ {
-		l, hs := createHttpServer()
+		l, _ := createHttpServer()
 		if config.TunnelType == "local" {
 			source[i] = "127.0.0.1:0"
 			destination[i] = l.Addr().String()
@@ -584,7 +704,6 @@ func prepareTunnel(config *tunnelConfig) (tun *Tunnel, ssh net.Listener, hss []*
 			config.T.Errorf("could not configure destination endpoints for testing: %v\n", err)
 			return
 		}
-		hss = append(hss, hs)
 	}
 
 	tun, _ = New(config.TunnelType, srv, source, destination, configPath)
@@ -592,17 +711,16 @@ func prepareTunnel(config *tunnelConfig) (tun *Tunnel, ssh net.Listener, hss []*
 	tun.WaitAndRetry = 3 * time.Second
 	tun.KeepAliveInterval = 10 * time.Second
 
+	// the value returned by Tunnel.Start can't be given to *testing.T from
+	// here: it would be reported after the test that created the tunnel is
+	// over, failing it. Tests that care about it read the channel instead.
+	result := make(chan error, 1)
+
 	go func(tun *Tunnel) {
-		err := tun.Start()
-		// FIXME: this message should be shown through *testing.t but using it here
-		// would cause the message to be printed after the test ends (goroutine),
-		// making the test to fail
-		if err != nil {
-			fmt.Printf("error returned from tunnel start: %v", err)
-		}
+		result <- tun.Start()
 	}(tun)
 
-	return tun, ssh, hss
+	return tun, ssh, result
 }
 
 func prepareTestEnv() error {
