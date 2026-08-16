@@ -218,6 +218,9 @@ type Tunnel struct {
 	// stop is closed when the tunnel is shutting down, telling the channel
 	// goroutines that any error they get from that point on is expected.
 	stop chan struct{}
+	// acceptOnce keeps the goroutines accepting connections from the channel
+	// listeners from being started again on every reconnection.
+	acceptOnce sync.Once
 }
 
 // New creates a new instance of Tunnel.
@@ -475,63 +478,66 @@ func (t *Tunnel) connect() {
 		return
 	}
 
-	wg := &sync.WaitGroup{}
-	wg.Add(len(t.channels))
+	// The channel listeners are kept across reconnections, so the goroutines
+	// serving them are started only once. Starting a new set on every
+	// reconnection would pile them up on the very same listeners, leaving the
+	// previous ones blocked on Accept for as long as the tunnel lives.
+	t.acceptOnce.Do(func() {
+		for _, ch := range t.channels {
+			log.WithFields(log.Fields{
+				"source":      ch.Source,
+				"destination": ch.Destination,
+			}).Info("tunnel channel is waiting for connection")
 
-	// wait for all ssh channels to be ready to accept connections then sends a
-	// single message signalling all tunnels are ready
-	go func(tunnel *Tunnel, waitgroup *sync.WaitGroup) {
-		waitgroup.Wait()
-		t.Ready <- true
-	}(t, wg)
+			go t.acceptConnections(ch)
+		}
+	})
 
-	for _, ch := range t.channels {
-		go func(channel *SSHChannel, waitgroup *sync.WaitGroup) {
-			var once sync.Once
-
-			for {
-				once.Do(func() {
-					log.WithFields(log.Fields{
-						"source":      channel.Source,
-						"destination": channel.Destination,
-					}).Info("tunnel channel is waiting for connection")
-
-					waitgroup.Done()
-				})
-
-				conn, err := channel.Accept()
-				if err != nil {
-					// the listener is gone, so this channel will never serve
-					// another connection.
-					select {
-					case t.done <- err:
-					case <-t.stop:
-						// the tunnel is shutting down, which is what closed the
-						// listener in the first place, so there is no one left
-						// to report the error to.
-						log.WithError(err).WithFields(log.Fields{
-							"channel": channel,
-						}).Debug("tunnel channel stopped accepting connections")
-					}
-
-					return
-				}
-
-				// failing to forward a single connection is not fatal to the
-				// channel: the listener is still valid and the connection to
-				// the ssh server may still be reestablished by the reconnection
-				// logic.
-				if err := t.startChannel(channel, conn); err != nil {
-					conn.Close()
-
-					log.WithError(err).WithFields(log.Fields{
-						"channel": channel,
-					}).Error("error while establishing tunnel channel")
-				}
-			}
-		}(ch, wg)
+	// The tunnel is ready as soon as the listeners are bound: connections
+	// established before the goroutines above get to call Accept just wait on
+	// the listener backlog.
+	//
+	// The signal is best effort, otherwise a tunnel reconnecting more than once
+	// would get stuck here whenever no one is consuming Ready.
+	select {
+	case t.Ready <- true:
+	default:
 	}
+}
 
+// acceptConnections forwards every connection made to the source endpoint of
+// the given channel until its listener is closed.
+func (t *Tunnel) acceptConnections(channel *SSHChannel) {
+	for {
+		conn, err := channel.Accept()
+		if err != nil {
+			// the listener is gone, so this channel will never serve another
+			// connection.
+			select {
+			case t.done <- err:
+			case <-t.stop:
+				// the tunnel is shutting down, which is what closed the
+				// listener in the first place, so there is no one left to
+				// report the error to.
+				log.WithError(err).WithFields(log.Fields{
+					"channel": channel,
+				}).Debug("tunnel channel stopped accepting connections")
+			}
+
+			return
+		}
+
+		// failing to forward a single connection is not fatal to the channel:
+		// the listener is still valid and the connection to the ssh server may
+		// still be reestablished by the reconnection logic.
+		if err := t.startChannel(channel, conn); err != nil {
+			conn.Close()
+
+			log.WithError(err).WithFields(log.Fields{
+				"channel": channel,
+			}).Error("error while establishing tunnel channel")
+		}
+	}
 }
 
 func (t *Tunnel) keepAlive(client *ssh.Client) {

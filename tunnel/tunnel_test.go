@@ -11,7 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -303,6 +305,75 @@ func TestReconnectSSHServer(t *testing.T) {
 	}
 
 	tun.Stop()
+}
+
+func TestReconnectReusesChannelGoroutines(t *testing.T) {
+	c := &tunnelConfig{t, "local", 2, false, 3}
+	tun, ssh, _ := prepareTunnel(c)
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(1 * time.Second):
+		t.Errorf("error waiting for tunnel to be ready")
+		return
+	}
+
+	err := validateTunnelConnectivity(t, "ABC", tun)
+	if err != nil {
+		t.Errorf("%v", err)
+		return
+	}
+
+	expected := len(tun.channels)
+	if goroutines := countAcceptGoroutines(); goroutines != expected {
+		t.Errorf("expected %d goroutines accepting connections, but %d are running", expected, goroutines)
+		return
+	}
+
+	ssh.Close()
+
+	_, err = createSSHServer(t, ssh.Addr().String(), keyPath)
+	if err != nil {
+		t.Errorf("error while recreating ssh server: %s", err)
+		return
+	}
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(10 * time.Second): // this is the maximum timeout based on the retries attempts
+		t.Errorf("error waiting for tunnel to be ready")
+		return
+	}
+
+	err = validateTunnelConnectivity(t, "GHJ", tun)
+	if err != nil {
+		t.Errorf("%v", err)
+		return
+	}
+
+	if goroutines := countAcceptGoroutines(); goroutines != expected {
+		t.Errorf("the %d goroutines accepting connections should have been reused after the reconnection, but %d are running", expected, goroutines)
+	}
+
+	tun.Stop()
+}
+
+// countAcceptGoroutines returns the number of goroutines currently accepting
+// connections on behalf of a tunnel channel.
+func countAcceptGoroutines() int {
+	frame := "tunnel.(*Tunnel).acceptConnections("
+
+	for size := 1 << 16; ; size *= 2 {
+		buf := make([]byte, size)
+
+		// a truncated dump would leave goroutines out of the count, so the
+		// buffer grows until it fits the whole thing.
+		if n := runtime.Stack(buf, true); n < size {
+			return strings.Count(string(buf[:n]), frame)
+		}
+	}
 }
 
 func validateTunnelConnectivity(t *testing.T, expected string, tun *Tunnel) error {
