@@ -138,58 +138,52 @@ func TestRpcAddress(t *testing.T) {
 }
 
 func TestMain(m *testing.M) {
-	home, err := setup()
+	testDir, err := setup()
 	if err != nil {
-		fmt.Printf("error while loading data for TestShow: %v", err)
-		os.RemoveAll(home)
+		fmt.Printf("error while setting up tests: %v", err)
+		os.RemoveAll(testDir)
 		os.Exit(1)
 	}
 
 	code := m.Run()
 
-	os.RemoveAll(home)
+	os.RemoveAll(testDir)
 
 	os.Exit(code)
 
 }
 
-// setup prepares the system environment to run the tests by:
-// 1. Create temp dir and <dir>/.mole
-// 2. Copy fixtures to <dir>/.mole
-// 3. Set temp dir as the user testDir dir
+// setup prepares the system environment to run the tests by creating a temp
+// directory and making it the user home directory, returning it so that the
+// caller can remove it once the tests are over.
 func setup() (string, error) {
 	testDir, err := ioutil.TempDir("", "mole-fsutils")
 	if err != nil {
 		return "", fmt.Errorf("error while setting up tests: %v", err)
 	}
 
-	moleAliasDir := filepath.Join(testDir, ".mole")
-	/*
-		err = os.Mkdir(moleAliasDir, 0755)
-		if err != nil {
-			return "", fmt.Errorf("error while setting up tests: %v", err)
-		}
-	*/
-
 	err = os.Setenv("HOME", testDir)
 	if err != nil {
-		return "", fmt.Errorf("error while setting up tests: %v", err)
+		return testDir, fmt.Errorf("error while setting up tests: %v", err)
 	}
 
 	err = os.Setenv("USERPROFILE", testDir)
 	if err != nil {
-		return "", fmt.Errorf("error while setting up tests: %v", err)
+		return testDir, fmt.Errorf("error while setting up tests: %v", err)
 	}
 
 	home = testDir
 
-	return moleAliasDir, nil
+	return testDir, nil
 }
 
 func createPidFile(id string, pid int) error {
 	dir := filepath.Join(home, ".mole", id)
 
-	err := os.Mkdir(dir, 0755)
+	// the directory is not necessarily missing: its parent is only created by
+	// whichever test gets there first, and the test itself runs again on every
+	// repetition asked for through -count
+	err := os.MkdirAll(dir, 0755)
 	if err != nil {
 		return err
 	}
