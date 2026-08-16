@@ -307,7 +307,7 @@ func TestReconnectSSHServer(t *testing.T) {
 	tun.Stop()
 }
 
-func TestReconnectReusesChannelGoroutines(t *testing.T) {
+func TestReconnectDoesNotPileUpGoroutines(t *testing.T) {
 	c := &tunnelConfig{t, "local", 2, false, 3}
 	tun, ssh, _ := prepareTunnel(c)
 
@@ -325,9 +325,15 @@ func TestReconnectReusesChannelGoroutines(t *testing.T) {
 		return
 	}
 
-	expected := len(tun.channels)
-	if goroutines := countAcceptGoroutines(); goroutines != expected {
-		t.Errorf("expected %d goroutines accepting connections, but %d are running", expected, goroutines)
+	channels := len(tun.channels)
+
+	if err := waitForGoroutines(acceptFrame, channels, 2*time.Second); err != nil {
+		t.Errorf("%v", err)
+		return
+	}
+
+	if err := waitForGoroutines(keepAliveFrame, 1, 2*time.Second); err != nil {
+		t.Errorf("%v", err)
 		return
 	}
 
@@ -353,8 +359,15 @@ func TestReconnectReusesChannelGoroutines(t *testing.T) {
 		return
 	}
 
-	if goroutines := countAcceptGoroutines(); goroutines != expected {
-		t.Errorf("the %d goroutines accepting connections should have been reused after the reconnection, but %d are running", expected, goroutines)
+	// the listeners survive the reconnection, so the goroutines serving them
+	// must be the same ones, and the connection that has been replaced must not
+	// have left its keep alive behind
+	if err := waitForGoroutines(acceptFrame, channels, 2*time.Second); err != nil {
+		t.Errorf("reconnection did not reuse the goroutines accepting connections: %v", err)
+	}
+
+	if err := waitForGoroutines(keepAliveFrame, 1, 2*time.Second); err != nil {
+		t.Errorf("reconnection left more than one keep alive behind: %v", err)
 	}
 
 	tun.Stop()
@@ -482,11 +495,14 @@ func TestTunnelNeverGivesUpReconnecting(t *testing.T) {
 	tun.Stop()
 }
 
-// countAcceptGoroutines returns the number of goroutines currently accepting
-// connections on behalf of a tunnel channel.
-func countAcceptGoroutines() int {
-	frame := "tunnel.(*Tunnel).acceptConnections("
+const (
+	acceptFrame    = "tunnel.(*Tunnel).acceptConnections("
+	keepAliveFrame = "tunnel.(*Tunnel).keepAlive("
+)
 
+// countGoroutines returns the number of goroutines currently running the
+// function identified by the given stack frame.
+func countGoroutines(frame string) int {
 	for size := 1 << 16; ; size *= 2 {
 		buf := make([]byte, size)
 
@@ -495,6 +511,27 @@ func countAcceptGoroutines() int {
 		if n := runtime.Stack(buf, true); n < size {
 			return strings.Count(string(buf[:n]), frame)
 		}
+	}
+}
+
+// waitForGoroutines waits until exactly the given number of goroutines is
+// running the function identified by the given stack frame, which keeps the
+// counting from being thrown off by goroutines of a previous test that have not
+// been scheduled to finish yet.
+func waitForGoroutines(frame string, expected int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for {
+		goroutines := countGoroutines(frame)
+		if goroutines == expected {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("expected %d goroutines running %s but %d are running", expected, frame, goroutines)
+		}
+
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 

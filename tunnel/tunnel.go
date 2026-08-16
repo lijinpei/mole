@@ -211,10 +211,9 @@ type Tunnel struct {
 	// client is replaced on every reconnection while the goroutines serving
 	// the channels keep running, so it must only be reached through
 	// sshClient and setSSHClient.
-	client        *ssh.Client
-	clientMutex   sync.RWMutex
-	stopKeepAlive chan bool
-	reconnect     chan error
+	client      *ssh.Client
+	clientMutex sync.RWMutex
+	reconnect   chan error
 	// stop is closed when the tunnel is shutting down, telling the channel
 	// goroutines that any error they get from that point on is expected.
 	stop chan struct{}
@@ -240,14 +239,13 @@ func New(tunnelType string, server *Server, source, destination []string, config
 	}
 
 	return &Tunnel{
-		Type:          tunnelType,
-		Ready:         make(chan bool, 1),
-		channels:      channels,
-		server:        server,
-		reconnect:     make(chan error, 1),
-		done:          make(chan error, 1),
-		stopKeepAlive: make(chan bool, 1),
-		stop:          make(chan struct{}),
+		Type:      tunnelType,
+		Ready:     make(chan bool, 1),
+		channels:  channels,
+		server:    server,
+		reconnect: make(chan error, 1),
+		done:      make(chan error, 1),
+		stop:      make(chan struct{}),
 	}, nil
 }
 
@@ -290,8 +288,6 @@ func (t *Tunnel) Start() error {
 
 			log.WithError(err).Warnf("reconnecting to ssh server")
 
-			t.stopKeepAlive <- true
-
 			if client := t.sshClient(); client != nil {
 				client.Close()
 			}
@@ -326,7 +322,6 @@ func (t *Tunnel) shutdown(err error) error {
 	t.closeChannels()
 
 	if client := t.sshClient(); client != nil {
-		t.stopKeepAlive <- true
 		client.Close()
 	}
 
@@ -464,6 +459,11 @@ func (t *Tunnel) dial() error {
 
 	t.setSSHClient(client)
 
+	// disconnected is closed as soon as the connection just established is
+	// gone, so that everything bound to it stops with it rather than through a
+	// signal a later connection could end up consuming.
+	disconnected := make(chan struct{})
+
 	// both goroutines below are bound to the connection just established, so
 	// they are given it instead of reaching for whatever connection the tunnel
 	// happens to be using by the time they run.
@@ -471,8 +471,8 @@ func (t *Tunnel) dial() error {
 	// The connection is watched whatever the retry configuration is: the tunnel
 	// can only forward anything while it is up, so its loss either starts a
 	// reconnection or ends the tunnel.
-	go t.keepAlive(client)
-	go t.waitAndReconnect(client)
+	go t.keepAlive(client, disconnected)
+	go t.watchConnection(client, disconnected)
 
 	log.WithFields(log.Fields{
 		"server": t.server,
@@ -481,8 +481,14 @@ func (t *Tunnel) dial() error {
 	return nil
 }
 
-func (t *Tunnel) waitAndReconnect(client *ssh.Client) {
-	t.reconnect <- client.Wait()
+// watchConnection waits for the given connection to be gone, telling everything
+// bound to it to stop before reporting the loss to Start.
+func (t *Tunnel) watchConnection(client *ssh.Client, disconnected chan<- struct{}) {
+	err := client.Wait()
+
+	close(disconnected)
+
+	t.reconnect <- err
 }
 
 func (t *Tunnel) connect() {
@@ -562,7 +568,8 @@ func (t *Tunnel) acceptConnections(channel *SSHChannel) {
 	}
 }
 
-func (t *Tunnel) keepAlive(client *ssh.Client) {
+// keepAlive pings the given connection to the ssh server until it is gone.
+func (t *Tunnel) keepAlive(client *ssh.Client, disconnected <-chan struct{}) {
 	ticker := time.NewTicker(t.KeepAliveInterval)
 	defer ticker.Stop()
 
@@ -575,7 +582,7 @@ func (t *Tunnel) keepAlive(client *ssh.Client) {
 			if err != nil {
 				log.Warnf("error sending keep-alive request to ssh server: %v", err)
 			}
-		case <-t.stopKeepAlive:
+		case <-disconnected:
 			log.Debug("stop sending keep alive packets")
 			return
 		}
