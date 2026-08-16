@@ -126,52 +126,76 @@ type SSHChannel struct {
 	ChannelType string
 	Source      string
 	Destination string
-	listener    net.Listener
+
+	// the listener of a remote channel is replaced whenever the tunnel
+	// reconnects to the ssh server, while everything else keeps running, so
+	// the state below is only touched while holding the mutex.
+	mutex    sync.Mutex
+	listener net.Listener
+	// client is the connection to the ssh server the listener of a remote
+	// channel was created on.
+	client *ssh.Client
 }
 
-// Listen creates tcp listeners for each channel defined.
-func (ch *SSHChannel) Listen(serverClient *ssh.Client) error {
+// Listen creates the listener the channel accepts connections from, unless it
+// already has a usable one, and returns it.
+//
+// The listener of a remote channel is created on the given connection to the
+// ssh server and dies with it, so a new one is created every time the tunnel
+// connects to the server again. A local listener does not depend on the ssh
+// server and is kept for as long as the channel lives.
+//
+// A nil listener is returned, with no error, when the channel is already
+// listening on a usable one.
+func (ch *SSHChannel) Listen(serverClient *ssh.Client) (net.Listener, error) {
+	ch.mutex.Lock()
+	defer ch.mutex.Unlock()
+
 	var l net.Listener
 	var err error
 
-	if ch.listener == nil {
-		if ch.ChannelType == "local" {
-			l, err = net.Listen("tcp", ch.Source)
-		} else if ch.ChannelType == "remote" {
-			l, err = serverClient.Listen("tcp", ch.Source)
-		} else {
-			return fmt.Errorf("channel can't listen on endpoint: unknown channel type %s", ch.ChannelType)
+	switch ch.ChannelType {
+	case "local":
+		if ch.listener != nil {
+			return nil, nil
 		}
 
-		if err != nil {
-			return err
+		l, err = net.Listen("tcp", ch.Source)
+	case "remote":
+		if ch.listener != nil && ch.client == serverClient {
+			return nil, nil
 		}
 
-		ch.listener = l
+		if serverClient == nil {
+			return nil, fmt.Errorf("channel can't listen on endpoint: no connection to the ssh server")
+		}
 
-		// update the endpoint value with assigned port for the cases where the user
-		// haven't explicitily specified one
-		ch.Source = l.Addr().String()
+		l, err = serverClient.Listen("tcp", ch.Source)
+	default:
+		return nil, fmt.Errorf("channel can't listen on endpoint: unknown channel type %s", ch.ChannelType)
 	}
 
-	return nil
-}
-
-// Accept waits for and returns the next connection to the SSHChannel. The
-// caller owns the returned connection and is responsible for closing it.
-func (ch *SSHChannel) Accept() (net.Conn, error) {
-	conn, err := ch.listener.Accept()
 	if err != nil {
-		return nil, fmt.Errorf("error while establishing connection: %v", err)
+		return nil, err
 	}
 
-	return conn, nil
+	ch.listener = l
+	ch.client = serverClient
+
+	// update the endpoint value with assigned port for the cases where the user
+	// haven't explicitily specified one
+	ch.Source = l.Addr().String()
+
+	return l, nil
 }
 
 // Close closes the channel listener, releasing the source endpoint and
 // unblocking any Accept call in progress. Connections already accepted are
 // owned by their caller and are not affected.
 func (ch *SSHChannel) Close() error {
+	ch.mutex.Lock()
+	defer ch.mutex.Unlock()
+
 	if ch.listener == nil {
 		return nil
 	}
@@ -179,8 +203,37 @@ func (ch *SSHChannel) Close() error {
 	return ch.listener.Close()
 }
 
+// address returns the address the channel is listening on, which is empty
+// while it has no listener.
+func (ch *SSHChannel) address() string {
+	ch.mutex.Lock()
+	defer ch.mutex.Unlock()
+
+	if ch.listener == nil {
+		return ""
+	}
+
+	return ch.listener.Addr().String()
+}
+
+// copy returns a copy of the channel carrying its configuration alone, since
+// the listener it is serving can't be handed over.
+func (ch *SSHChannel) copy() *SSHChannel {
+	ch.mutex.Lock()
+	defer ch.mutex.Unlock()
+
+	return &SSHChannel{
+		ChannelType: ch.ChannelType,
+		Source:      ch.Source,
+		Destination: ch.Destination,
+	}
+}
+
 // String returns a string representation of a SSHChannel
-func (ch SSHChannel) String() string {
+func (ch *SSHChannel) String() string {
+	ch.mutex.Lock()
+	defer ch.mutex.Unlock()
+
 	return fmt.Sprintf("[source=%s, destination=%s]", ch.Source, ch.Destination)
 }
 
@@ -217,9 +270,6 @@ type Tunnel struct {
 	// stop is closed when the tunnel is shutting down, telling the channel
 	// goroutines that any error they get from that point on is expected.
 	stop chan struct{}
-	// acceptOnce keeps the goroutines accepting connections from the channel
-	// listeners from being started again on every reconnection.
-	acceptOnce sync.Once
 }
 
 // New creates a new instance of Tunnel.
@@ -335,14 +385,32 @@ func (t *Tunnel) reconnectionDisabled() bool {
 	return t.ConnectionRetries < 0
 }
 
-// Listen creates tcp listeners for each channel defined.
+// Listen creates the listeners the tunnel channels are missing and starts
+// serving the connections made to them.
+//
+// It is called again on every reconnection to the ssh server: a local channel
+// keeps the listener it already has, and with it the goroutine serving it,
+// while a remote one gets a new listener, and a goroutine to serve it, since
+// the previous listener died with the connection it was created on.
 func (t *Tunnel) Listen() error {
 	client := t.sshClient()
 
 	for _, ch := range t.channels {
-		if err := ch.Listen(client); err != nil {
+		listener, err := ch.Listen(client)
+		if err != nil {
 			return err
 		}
+
+		if listener == nil {
+			continue
+		}
+
+		log.WithFields(log.Fields{
+			"source":      ch.Source,
+			"destination": ch.Destination,
+		}).Info("tunnel channel is waiting for connection")
+
+		go t.acceptConnections(ch, listener)
 	}
 
 	return nil
@@ -506,24 +574,9 @@ func (t *Tunnel) connect() {
 		return
 	}
 
-	// The channel listeners are kept across reconnections, so the goroutines
-	// serving them are started only once. Starting a new set on every
-	// reconnection would pile them up on the very same listeners, leaving the
-	// previous ones blocked on Accept for as long as the tunnel lives.
-	t.acceptOnce.Do(func() {
-		for _, ch := range t.channels {
-			log.WithFields(log.Fields{
-				"source":      ch.Source,
-				"destination": ch.Destination,
-			}).Info("tunnel channel is waiting for connection")
-
-			go t.acceptConnections(ch)
-		}
-	})
-
 	// The tunnel is ready as soon as the listeners are bound: connections
-	// established before the goroutines above get to call Accept just wait on
-	// the listener backlog.
+	// established before the goroutines serving them get to call Accept just
+	// wait on the listener backlog.
 	//
 	// The signal is best effort, otherwise a tunnel reconnecting more than once
 	// would get stuck here whenever no one is consuming Ready.
@@ -533,25 +586,13 @@ func (t *Tunnel) connect() {
 	}
 }
 
-// acceptConnections forwards every connection made to the source endpoint of
-// the given channel until its listener is closed.
-func (t *Tunnel) acceptConnections(channel *SSHChannel) {
+// acceptConnections forwards every connection made to the given listener, which
+// must be the one the given channel is listening on, until it is closed.
+func (t *Tunnel) acceptConnections(channel *SSHChannel, listener net.Listener) {
 	for {
-		conn, err := channel.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
-			// the listener is gone, so this channel will never serve another
-			// connection.
-			select {
-			case t.done <- err:
-			case <-t.stop:
-				// the tunnel is shutting down, which is what closed the
-				// listener in the first place, so there is no one left to
-				// report the error to.
-				log.WithError(err).WithFields(log.Fields{
-					"channel": channel,
-				}).Debug("tunnel channel stopped accepting connections")
-			}
-
+			t.stopServing(channel, fmt.Errorf("error while establishing connection: %v", err))
 			return
 		}
 
@@ -565,6 +606,51 @@ func (t *Tunnel) acceptConnections(channel *SSHChannel) {
 				"channel": channel,
 			}).Error("error while establishing tunnel channel")
 		}
+	}
+}
+
+// stopServing reports that a channel stopped accepting connections, ending the
+// tunnel when it is not something the tunnel can recover from.
+func (t *Tunnel) stopServing(channel *SSHChannel, err error) {
+	if t.stopping() {
+		// the tunnel is shutting down, which is what closed the listener in the
+		// first place, so there is no one left to report the error to.
+		log.WithError(err).WithFields(log.Fields{
+			"channel": channel,
+		}).Debug("tunnel channel stopped accepting connections")
+
+		return
+	}
+
+	if channel.ChannelType == "remote" {
+		// the listener of a remote channel dies with the connection to the ssh
+		// server it was created on, and a new one is created, and served, as
+		// soon as the tunnel connects to the server again.
+		log.WithError(err).WithFields(log.Fields{
+			"channel": channel,
+		}).Warn("tunnel channel stopped accepting connections until the tunnel reconnects to the ssh server")
+
+		return
+	}
+
+	// the listener of a local channel is not replaced, so the channel is done
+	// for and so is the tunnel.
+	select {
+	case t.done <- err:
+	case <-t.stop:
+		log.WithError(err).WithFields(log.Fields{
+			"channel": channel,
+		}).Debug("tunnel channel stopped accepting connections")
+	}
+}
+
+// stopping tells whether the tunnel is shutting down.
+func (t *Tunnel) stopping() bool {
+	select {
+	case <-t.stop:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -594,8 +680,7 @@ func (t *Tunnel) Channels() []*SSHChannel {
 	channels := make([]*SSHChannel, len(t.channels))
 
 	for i, c := range t.channels {
-		cc := *c
-		channels[i] = &cc
+		channels[i] = c.copy()
 	}
 
 	return channels

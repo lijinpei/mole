@@ -223,7 +223,7 @@ func TestTunnelStopReleasesSourceEndpoints(t *testing.T) {
 
 	sources := []string{}
 	for _, sshChan := range tun.channels {
-		sources = append(sources, sshChan.listener.Addr().String())
+		sources = append(sources, sshChan.address())
 	}
 
 	tun.Stop()
@@ -371,6 +371,86 @@ func TestReconnectDoesNotPileUpGoroutines(t *testing.T) {
 	}
 
 	tun.Stop()
+}
+
+// The listener of a remote channel is created on the connection to the ssh
+// server and dies with it, so the tunnel has to create a new one, and serve it,
+// every time it reconnects.
+func TestRemoteChannelListensAgainAfterReconnection(t *testing.T) {
+	c := &tunnelConfig{t, "remote", 1, true, 3}
+	tun, ssh, started := prepareTunnel(c)
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(1 * time.Second):
+		t.Errorf("error waiting for tunnel to be ready")
+		return
+	}
+
+	channel := tun.channels[0]
+	listener, client := channelListener(channel)
+
+	if listener == nil {
+		t.Errorf("the remote channel is not listening")
+		return
+	}
+
+	if err := waitForGoroutines(acceptFrame, 1, 2*time.Second); err != nil {
+		t.Errorf("%v", err)
+		return
+	}
+
+	ssh.Close()
+
+	_, err := createSSHServer(t, ssh.Addr().String(), keyPath)
+	if err != nil {
+		t.Errorf("error while recreating ssh server: %s", err)
+		return
+	}
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case err := <-started:
+		t.Errorf("the tunnel should have reconnected to the ssh server, but it stopped: %v", err)
+		return
+	case <-time.After(10 * time.Second): // this is the maximum timeout based on the retries attempts
+		t.Errorf("error waiting for tunnel to be ready")
+		return
+	}
+
+	newListener, newClient := channelListener(channel)
+
+	if newClient == client {
+		t.Errorf("the remote channel is still bound to the connection to the ssh server that is gone")
+		return
+	}
+
+	if newClient != tun.sshClient() {
+		t.Errorf("the remote channel should be listening on the connection to the ssh server the tunnel is using now")
+	}
+
+	if newListener == listener {
+		t.Errorf("the remote channel is still listening on the listener that died with the previous connection to the ssh server")
+	}
+
+	// the goroutine serving the listener that is gone must have been replaced
+	// by one serving the listener created on the new connection
+	if err := waitForGoroutines(acceptFrame, 1, 2*time.Second); err != nil {
+		t.Errorf("%v", err)
+	}
+
+	tun.Stop()
+}
+
+// channelListener returns what the given channel is listening on and the
+// connection to the ssh server that listener was created on.
+func channelListener(ch *SSHChannel) (net.Listener, *ssh.Client) {
+	ch.mutex.Lock()
+	defer ch.mutex.Unlock()
+
+	return ch.listener, ch.client
 }
 
 // A negative number of connection retries asks the tunnel to give up on the
@@ -537,7 +617,7 @@ func waitForGoroutines(frame string, expected int, timeout time.Duration) error 
 
 func validateTunnelConnectivity(t *testing.T, expected string, tun *Tunnel) error {
 	for _, sshChan := range tun.channels {
-		url := fmt.Sprintf("http://%s/%s", sshChan.listener.Addr(), expected)
+		url := fmt.Sprintf("http://%s/%s", sshChan.address(), expected)
 		timeout := time.Duration(500 * time.Millisecond)
 		client := http.Client{
 			Timeout: timeout,
