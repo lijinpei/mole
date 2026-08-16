@@ -16,7 +16,7 @@ import (
 	"github.com/davrodpin/mole/tunnel"
 
 	"github.com/awnumar/memguard"
-	"github.com/gofrs/uuid"
+	"github.com/gofrs/uuid/v5"
 	"github.com/mitchellh/mapstructure"
 	daemon "github.com/sevlyar/go-daemon"
 	log "github.com/sirupsen/logrus"

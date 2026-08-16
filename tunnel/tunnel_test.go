@@ -533,7 +533,7 @@ func prepareTestEnv() error {
 func createHttpServer() (net.Listener, *http.Server) {
 
 	handler := func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, r.URL.Path[1:])
+		fmt.Fprint(w, r.URL.Path[1:])
 	}
 
 	mux := http.NewServeMux()

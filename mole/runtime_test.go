@@ -16,11 +16,11 @@ verbose = false
 insecure = false
 detach = false
 key = ""
-keep-alive-interval = 0
+keep-alive-interval = "0s"
 connection-retries = 0
-wait-and-retry = 0
+wait-and-retry = "0s"
 ssh-agent = ""
-timeout = 0
+timeout = "0s"
 ssh-config = ""
 rpc = false
 rpc-address = ""
@@ -38,11 +38,11 @@ const expectedMultipleInstances string = `[instances]
     insecure = false
     detach = false
     key = ""
-    keep-alive-interval = 0
+    keep-alive-interval = "0s"
     connection-retries = 0
-    wait-and-retry = 0
+    wait-and-retry = "0s"
     ssh-agent = ""
-    timeout = 0
+    timeout = "0s"
     ssh-config = ""
     rpc = false
     rpc-address = ""
@@ -57,11 +57,11 @@ const expectedMultipleInstances string = `[instances]
     insecure = false
     detach = false
     key = ""
-    keep-alive-interval = 0
+    keep-alive-interval = "0s"
     connection-retries = 0
-    wait-and-retry = 0
+    wait-and-retry = "0s"
     ssh-agent = ""
-    timeout = 0
+    timeout = "0s"
     ssh-config = ""
     rpc = false
     rpc-address = ""
@@ -90,7 +90,7 @@ func TestFormatRuntimeToML(t *testing.T) {
 		out, err := test.formatter.Format("toml")
 
 		if err != nil {
-			t.Errorf(err.Error())
+			t.Errorf("%v", err)
 		}
 
 		if a, e := strings.TrimSpace(out), strings.TrimSpace(test.expected); a != e {
@@ -105,7 +105,7 @@ func TestClientRunning(t *testing.T) {
 	// Mock the pid file using the process id of the program running the test
 	_, err := fsutils.CreateInstanceDir(id)
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Errorf("%v", err)
 	}
 
 	conf := &mole.Configuration{Id: id}
@@ -113,7 +113,7 @@ func TestClientRunning(t *testing.T) {
 
 	running, err := client.Running()
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Errorf("%v", err)
 	}
 
 	if !running {

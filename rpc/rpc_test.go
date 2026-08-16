@@ -51,7 +51,7 @@ func TestHandler(t *testing.T) {
 
 func TestMethodNotRegistered(t *testing.T) {
 	method := "methodnotregistered"
-	expectedResponse := fmt.Sprintf(`{"code":-32601,"data":null,"message":"method %s not found"}`, method)
+	expectedResponse := fmt.Sprintf(`{"code":-32601,"message":"method %s not found"}`, method)
 
 	response, err := rpc.Call(context.Background(), addr.String(), method, "param")
 	if err != nil {
@@ -70,7 +70,7 @@ func TestMethodNotRegistered(t *testing.T) {
 
 func TestMethodWithError(t *testing.T) {
 	method := "testwitherror"
-	expectedResponse := fmt.Sprintf(`{"code":-32603,"data":null,"message":"error executing rpc method %s"}`, method)
+	expectedResponse := fmt.Sprintf(`{"code":-32603,"message":"error executing rpc method %s"}`, method)
 
 	rpc.Register(method, func(params interface{}) (json.RawMessage, error) {
 		return nil, fmt.Errorf("error")
