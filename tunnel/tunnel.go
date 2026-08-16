@@ -168,6 +168,17 @@ func (ch *SSHChannel) Accept() (net.Conn, error) {
 	return conn, nil
 }
 
+// Close closes the channel listener, releasing the source endpoint and
+// unblocking any Accept call in progress. Connections already accepted are
+// owned by their caller and are not affected.
+func (ch *SSHChannel) Close() error {
+	if ch.listener == nil {
+		return nil
+	}
+
+	return ch.listener.Close()
+}
+
 // String returns a string representation of a SSHChannel
 func (ch SSHChannel) String() string {
 	return fmt.Sprintf("[source=%s, destination=%s]", ch.Source, ch.Destination)
@@ -200,6 +211,9 @@ type Tunnel struct {
 	client        *ssh.Client
 	stopKeepAlive chan bool
 	reconnect     chan error
+	// stop is closed when the tunnel is shutting down, telling the channel
+	// goroutines that any error they get from that point on is expected.
+	stop chan struct{}
 }
 
 // New creates a new instance of Tunnel.
@@ -226,6 +240,7 @@ func New(tunnelType string, server *Server, source, destination []string, config
 		reconnect:     make(chan error, 1),
 		done:          make(chan error, 1),
 		stopKeepAlive: make(chan bool, 1),
+		stop:          make(chan struct{}),
 	}, nil
 }
 
@@ -258,6 +273,15 @@ func (t *Tunnel) Start() error {
 				go t.connect()
 			}
 		case err := <-t.done:
+			// signal the shutdown before closing the listeners so the channel
+			// goroutines know the errors they are about to get from Accept are
+			// expected.
+			close(t.stop)
+
+			// the listeners of remote channels live on the ssh connection, so
+			// they must be closed before the ssh client.
+			t.closeChannels()
+
 			if t.client != nil {
 				t.stopKeepAlive <- true
 				t.client.Close()
@@ -279,11 +303,26 @@ func (t *Tunnel) Listen() error {
 	return nil
 }
 
-func (t *Tunnel) startChannel(channel *SSHChannel) error {
-	conn, err := channel.Accept()
-	if err != nil {
-		return err
+// closeChannels closes the listener of every channel defined, releasing the
+// source endpoints back to the system.
+func (t *Tunnel) closeChannels() {
+	for _, ch := range t.channels {
+		if err := ch.Close(); err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"channel": ch,
+			}).Debug("error while closing tunnel channel listener")
+		}
 	}
+}
+
+// startChannel forwards the given connection, which must have been accepted
+// from the given channel, to the channel destination.
+//
+// On success both connections are handed over to copyConn, which closes them
+// once either side is done. On error conn is left untouched and closing it is
+// up to the caller.
+func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn) error {
+	var err error
 
 	log.WithFields(log.Fields{
 		"channel": channel,
@@ -413,7 +452,6 @@ func (t *Tunnel) connect() {
 
 	for _, ch := range t.channels {
 		go func(channel *SSHChannel, waitgroup *sync.WaitGroup) {
-			var err error
 			var once sync.Once
 
 			for {
@@ -426,10 +464,34 @@ func (t *Tunnel) connect() {
 					waitgroup.Done()
 				})
 
-				err = t.startChannel(channel)
+				conn, err := channel.Accept()
 				if err != nil {
-					t.done <- err
+					// the listener is gone, so this channel will never serve
+					// another connection.
+					select {
+					case t.done <- err:
+					case <-t.stop:
+						// the tunnel is shutting down, which is what closed the
+						// listener in the first place, so there is no one left
+						// to report the error to.
+						log.WithError(err).WithFields(log.Fields{
+							"channel": channel,
+						}).Debug("tunnel channel stopped accepting connections")
+					}
+
 					return
+				}
+
+				// failing to forward a single connection is not fatal to the
+				// channel: the listener is still valid and the connection to
+				// the ssh server may still be reestablished by the reconnection
+				// logic.
+				if err := t.startChannel(channel, conn); err != nil {
+					conn.Close()
+
+					log.WithError(err).WithFields(log.Fields{
+						"channel": channel,
+					}).Error("error while establishing tunnel channel")
 				}
 			}
 		}(ch, wg)

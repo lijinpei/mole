@@ -201,6 +201,61 @@ func TestTunnelMultipleDestinations(t *testing.T) {
 	tun.Stop()
 }
 
+func TestTunnelStopReleasesSourceEndpoints(t *testing.T) {
+	c := &tunnelConfig{t, "local", 2, false, NoSshRetries}
+	tun, _, _ := prepareTunnel(c)
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(1 * time.Second):
+		t.Errorf("error waiting for tunnel to be ready")
+		return
+	}
+
+	err := validateTunnelConnectivity(t, "ABC", tun)
+	if err != nil {
+		t.Errorf("%v", err)
+		return
+	}
+
+	sources := []string{}
+	for _, sshChan := range tun.channels {
+		sources = append(sources, sshChan.listener.Addr().String())
+	}
+
+	tun.Stop()
+
+	// the tunnel is stopped asynchronously, so give it a chance to close the
+	// listeners before checking the source endpoints have been released.
+	for _, source := range sources {
+		if err := waitForClosedEndpoint(source, 2*time.Second); err != nil {
+			t.Errorf("%v", err)
+		}
+	}
+}
+
+// waitForClosedEndpoint waits until no connection can be established to the
+// given address anymore, returning an error if that does not happen within the
+// given timeout.
+func waitForClosedEndpoint(address string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+
+	for {
+		conn, err := net.DialTimeout("tcp", address, 100*time.Millisecond)
+		if err != nil {
+			return nil
+		}
+		conn.Close()
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("endpoint %s is still accepting connections after the tunnel has been stopped", address)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func TestReconnectSSHServer(t *testing.T) {
 	c := &tunnelConfig{t, "local", 1, false, 3}
 	tun, ssh, _ := prepareTunnel(c)
