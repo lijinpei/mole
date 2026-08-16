@@ -24,3 +24,18 @@ Host hostWithTwoLocalForwards
     LocalForward 9090 172.17.0.1:9090
     User mole_test
     IdentityFile ~/.ssh/id_rsa
+
+Host hostWithDynamicForward
+    Hostname 127.0.0.1
+    Port 2222
+    DynamicForward 1080
+    User mole_test
+    IdentityFile ~/.ssh/id_rsa
+
+Host hostWithTwoDynamicForwards
+    Hostname 127.0.0.1
+    Port 2222
+    DynamicForward 1080
+    DynamicForward 192.168.1.1:1081
+    User mole_test
+    IdentityFile ~/.ssh/id_rsa

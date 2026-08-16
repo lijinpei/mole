@@ -77,6 +77,11 @@ func (r SSHConfigFile) Get(host string) *SSHHost {
 		log.Warningf("error reading remote configuration from ssh config file: %v", err)
 	}
 
+	dynamicForwards, err := r.getDynamicForwards(host)
+	if err != nil {
+		log.Warningf("error reading dynamic forwarding configuration from ssh config file: %v", err)
+	}
+
 	key := r.getKey(host)
 
 	identityAgent, err := r.sshConfig.Get(host, "IdentityAgent")
@@ -85,13 +90,14 @@ func (r SSHConfigFile) Get(host string) *SSHHost {
 	}
 
 	return &SSHHost{
-		Hostname:       hostname,
-		Port:           port,
-		User:           user,
-		Key:            key,
-		IdentityAgent:  identityAgent,
-		LocalForwards:  localForwards,
-		RemoteForwards: remoteForwards,
+		Hostname:        hostname,
+		Port:            port,
+		User:            user,
+		Key:             key,
+		IdentityAgent:   identityAgent,
+		LocalForwards:   localForwards,
+		RemoteForwards:  remoteForwards,
+		DynamicForwards: dynamicForwards,
 	}
 }
 
@@ -145,6 +151,48 @@ func (r SSHConfigFile) getForwards(forwardType, host string) ([]*ForwardConfig, 
 
 }
 
+// getDynamicForwards reads the DynamicForward settings of the given host, which
+// carry a source endpoint alone: the destination of every connection made to it
+// is given by the client through the socks protocol.
+func (r SSHConfigFile) getDynamicForwards(host string) ([]*ForwardConfig, error) {
+	fwds, err := r.sshConfig.GetAll(host, "DynamicForward")
+	if err != nil {
+		return nil, err
+	}
+
+	forwards := []*ForwardConfig{}
+
+	for _, c := range fwds {
+		if c == "" {
+			continue
+		}
+
+		l := strings.Fields(c)
+
+		if len(l) != 1 {
+			return nil, fmt.Errorf("malformed dynamic forwarding configuration on ssh config file: %s", l)
+		}
+
+		source := l[0]
+
+		if strings.HasPrefix(source, ":") {
+			source = fmt.Sprintf("127.0.0.1%s", source)
+		}
+
+		if !strings.Contains(source, ":") {
+			source = fmt.Sprintf("127.0.0.1:%s", source)
+		}
+
+		forwards = append(forwards, &ForwardConfig{Source: source})
+	}
+
+	if len(forwards) == 0 {
+		return nil, nil
+	}
+
+	return forwards, nil
+}
+
 func (r SSHConfigFile) getKey(host string) string {
 	id, err := r.sshConfig.Get(host, "IdentityFile")
 
@@ -165,22 +213,23 @@ func (r SSHConfigFile) getKey(host string) string {
 
 // SSHHost represents a host configuration extracted from a ssh config file.
 type SSHHost struct {
-	Hostname       string
-	Port           string
-	User           string
-	Key            string
-	IdentityAgent  string
-	LocalForwards  []*ForwardConfig
-	RemoteForwards []*ForwardConfig
+	Hostname        string
+	Port            string
+	User            string
+	Key             string
+	IdentityAgent   string
+	LocalForwards   []*ForwardConfig
+	RemoteForwards  []*ForwardConfig
+	DynamicForwards []*ForwardConfig
 }
 
 // String returns a string representation of a SSHHost.
 func (h SSHHost) String() string {
-	return fmt.Sprintf("[hostname=%s, port=%s, user=%s, key=%s, identity_agent=%s, local_forward=%v, remote_forward=%v]", h.Hostname, h.Port, h.User, h.Key, h.IdentityAgent, h.LocalForwards, h.RemoteForwards)
+	return fmt.Sprintf("[hostname=%s, port=%s, user=%s, key=%s, identity_agent=%s, local_forward=%v, remote_forward=%v, dynamic_forward=%v]", h.Hostname, h.Port, h.User, h.Key, h.IdentityAgent, h.LocalForwards, h.RemoteForwards, h.DynamicForwards)
 }
 
-// ForwardConfig represents either a LocalForward or a RemoteForward configuration
-// for SSHHost.
+// ForwardConfig represents a LocalForward, a RemoteForward or a DynamicForward
+// configuration for SSHHost. A DynamicForward carries no destination.
 type ForwardConfig struct {
 	Source      string
 	Destination string

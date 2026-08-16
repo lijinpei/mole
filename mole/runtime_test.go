@@ -6,6 +6,7 @@ import (
 
 	"github.com/davrodpin/mole/fsutils"
 	"github.com/davrodpin/mole/mole"
+	"github.com/davrodpin/mole/tunnel"
 
 	"github.com/andreyvit/diff"
 )
@@ -96,6 +97,32 @@ func TestFormatRuntimeToML(t *testing.T) {
 		if a, e := strings.TrimSpace(out), strings.TrimSpace(test.expected); a != e {
 			t.Errorf("Result not as expected:\n%v", diff.LineDiff(e, a))
 		}
+	}
+}
+
+func TestRuntimeOfDynamicTunnel(t *testing.T) {
+	// the tunnel is never started: Channels reports what it was configured with,
+	// which is all the runtime information is built from.
+	tun, err := tunnel.New("dynamic", &tunnel.Server{Name: "example"}, []string{"127.0.0.1:1080"}, nil, "")
+	if err != nil {
+		t.Fatalf("error while creating the tunnel: %v", err)
+	}
+
+	client := mole.Client{Conf: &mole.Configuration{Id: "dynamic-runtime"}, Tunnel: tun}
+
+	rt, err := client.Runtime()
+	if err != nil {
+		t.Fatalf("error while reading the runtime information: %v", err)
+	}
+
+	if len(rt.Source) != 1 || rt.Source[0].String() != "127.0.0.1:1080" {
+		t.Errorf("expected the source endpoint to be reported, but got %v", rt.Source.List())
+	}
+
+	// a dynamic channel has no destination, so reporting one would mean making
+	// an address up.
+	if len(rt.Destination) != 0 {
+		t.Errorf("expected no destination to be reported for a dynamic tunnel, but got %d: %q", len(rt.Destination), rt.Destination.List())
 	}
 }
 

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 ### Added
 - Support for multiple defined forwards in the SSH config file [#185]
+- Dynamic port forwarding, through the new `start dynamic` and `add alias
+  dynamic` commands, which turn a source endpoint into a SOCKS5 proxy reaching
+  every address its clients ask for from the ssh server. Host names are resolved
+  by the ssh server, so names that only exist in the remote network can be used,
+  and `DynamicForward` is read from the SSH config file when no `--source` is
+  given. Only the `CONNECT` command is served, since a ssh tunnel carries tcp
+  alone
 
 ### Fixed
 - Detached instances no longer lose the last two command line arguments. The id

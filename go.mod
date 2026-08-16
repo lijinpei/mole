@@ -15,6 +15,7 @@ require (
 	github.com/sourcegraph/jsonrpc2 v0.2.2
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
+	github.com/things-go/go-socks5 v0.1.1
 	golang.org/x/crypto v0.55.0
 	golang.org/x/term v0.45.0
 )

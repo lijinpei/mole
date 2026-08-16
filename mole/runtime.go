@@ -82,6 +82,13 @@ func (c *Client) Runtime() (*Runtime, error) {
 				return nil, err
 			}
 
+			// a dynamic channel has no destination of its own: every connection
+			// made to it carries the address it wants to reach, so there is
+			// nothing to report other than the endpoint it listens on.
+			if channel.Destination == "" {
+				continue
+			}
+
 			err = destination.Set(channel.Destination)
 			if err != nil {
 				return nil, err

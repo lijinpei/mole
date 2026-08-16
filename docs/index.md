@@ -15,6 +15,7 @@ INFO[0000] tunnel channel is waiting for connection      destination="127.0.0.1:
   * [Auto address selection](#let-mole-to-randomly-select-the-source-endpoint): find a port available and start listening to it, so the `--source` flag doesn't need to be given every time you run the app.
   * [Create multiple tunnels using a single ssh connection](#create-multiple-tunnels-using-a-single-ssh-connection): multiple tunnels can be established using a single connection to a ssh server by specifying different `--destination` flags.
   * [Aliases](#create-an-alias-so-there-is-no-need-to-remember-the-tunnel-settings-afterwards): save your tunnel settings under an alias, so it can be reused later.
+  * [SOCKS5 proxy](#start-a-socks5-proxy-with-dynamic-port-forwarding): with `start dynamic` there is no `--destination` to be given, since each client asks for the address it wants to reach and the names are resolved by the jump server.
   * Leverage the SSH Config File: use some options (e.g. user name, identity key and port), specified in *$HOME/.ssh/config* whenever possible, so there is no need to have the same SSH server configuration in multiple places.
   * Resiliency! Then tunnel will never go down if you don't want to:
     * Idle clients do not get disconnected from the ssh server since Mole keeps sending synthetic packets acting as a keep alive mechanism. 
@@ -27,6 +28,7 @@ INFO[0000] tunnel channel is waiting for connection      destination="127.0.0.1:
   * [Access a computer or service behind a firewall](#access-a-computer-or-service-behind-a-firewall)
   * [Access a service that is listening on a non-routable network](#access-a-service-that-is-listening-on-a-non-routable-network)
   * [Expose a service to someone outside your network](#expose-a-service-to-someone-outside-your-network)
+  * [Reach many services without knowing their addresses upfront](#reach-many-services-without-knowing-their-addresses-upfront)
 * [Installation](#installation)
   * [Linux and Mac](#linux-and-mac)
   * [Homebrew](#or-if-you-prefer-install-it-through-homebrew)
@@ -42,6 +44,8 @@ INFO[0000] tunnel channel is waiting for connection      destination="127.0.0.1:
   * [Start mole in background](#start-mole-in-background)
   * [Leveraging LocalForward from SSH configuration file](#leveraging-localforward-from-ssh-configuration-file)
   * [Leveraging RemoteForward from SSH configuration file](#leveraging-remoteforward-from-ssh-configuration-file)
+  * [Start a SOCKS5 proxy with dynamic port forwarding](#start-a-socks5-proxy-with-dynamic-port-forwarding)
+  * [Leveraging DynamicForward from SSH configuration file](#leveraging-dynamicforward-from-ssh-configuration-file)
   * [Create multiple tunnels using a single ssh connection](#create-multiple-tunnels-using-a-single-ssh-connection)
   * [Read the logs of any detached mole instance](#read-the-logs-of-any-detached-mole-instance)
 
@@ -161,6 +165,53 @@ $ mole start remote \
   --destination 127.0.0.1:8080 \
   --server user@172.17.0.100
 ```
+
+## Reach many services without knowing their addresses upfront
+
+A local or remote tunnel has to be told what it forwards to, which does not help
+much when the addresses are only discovered while the services are being used,
+as it happens while browsing an internal web site.
+
+**Mole** can instead turn the local computer into a **SOCKS5 proxy**, letting
+any application that speaks it ask, connection by connection, for whatever
+address it wants to reach. Host names are resolved by the **jump server**, so
+names that only exist in the remote network can be used as they are.
+
+```ascii
++---------------------+         +----------------------+
+|  Computer           |         |   Jump Server        |
+|                     |         |                      |
+|      browser        |         |                      |
+|        |            |         |                      |
+|        | connect    |         |                      |
+|       \ /           |  tunnel |                      |
+|       mole  --------+---------+-> (172.17.0.100:22)  |
+|  (127.0.0.1:1080)   |         |      ssh server      |
+|    socks5 proxy     |         |          |           |
+|    source address   |         |          | forward   |
+|                     |         |         \ /          |
++---------------------+         |   intranet.example   |
+                                |    (192.168.1.1:80)  |
+                                |                      |
+                                +----------------------+
+```
+
+```sh
+$ mole start dynamic \
+  --source 127.0.0.1:1080 \
+  --server user@172.17.0.100
+```
+
+Any client that speaks SOCKS5 can then reach the remote network through
+`127.0.0.1:1080`:
+
+```sh
+$ curl --socks5-hostname 127.0.0.1:1080 http://intranet.example
+```
+
+Only the `CONNECT` command is supported, since a ssh tunnel carries tcp alone,
+and no authentication is required to use the proxy, so the source endpoint
+should be kept on an address only trusted clients can reach.
 
 # Installation
 
@@ -317,6 +368,38 @@ Host example
   IdentityFile test-env/ssh-server/keys/key
 $ mole start remote --server example
 INFO[0000] tunnel channel is waiting for connection      destination="192.168.33.11:8080" source="127.0.0.1:9090"
+```
+
+### Start a SOCKS5 proxy with dynamic port forwarding
+
+No destination is given: each client asks for the address it wants to reach, and
+the name is resolved by the jump server rather than locally.
+
+```sh
+$ mole start dynamic \
+    --source 127.0.0.1:1080 \
+    --server example
+INFO[0000] tunnel channel is waiting for connection      source="127.0.0.1:1080"
+```
+
+`mole` keeps running in the foreground, so from another terminal:
+
+```sh
+$ curl --socks5-hostname 127.0.0.1:1080 http://192.168.33.11
+```
+
+### Leveraging DynamicForward from SSH configuration file
+
+```sh
+$ cat ~/.ssh/config
+Host example
+  User mole
+  Hostname 127.0.0.1
+  Port 22122
+  DynamicForward 1080
+  IdentityFile test-env/ssh-server/keys/key
+$ mole start dynamic --server example
+INFO[0000] tunnel channel is waiting for connection      source="127.0.0.1:1080"
 ```
 
 ### Create multiple tunnels using a single ssh connection

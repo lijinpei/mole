@@ -14,6 +14,7 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 
 	log "github.com/sirupsen/logrus"
+	socks5 "github.com/things-go/go-socks5"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
@@ -22,6 +23,10 @@ const (
 	HostMissing        = "server host has to be provided as part of the server address"
 	RandomPortAddress  = "127.0.0.1:0"
 	NoDestinationGiven = "cannot create a tunnel without at least one remote address"
+	// DestinationNotAllowed is the error given when a dynamic tunnel is created
+	// with destination addresses, which it has no use for: the destination of
+	// each of its connections is asked for by the client that made it.
+	DestinationNotAllowed = "cannot create a dynamic tunnel with destination addresses"
 )
 
 // Server holds the SSH Server attributes used for the client to connect to it.
@@ -142,8 +147,8 @@ type SSHChannel struct {
 //
 // The listener of a remote channel is created on the given connection to the
 // ssh server and dies with it, so a new one is created every time the tunnel
-// connects to the server again. A local listener does not depend on the ssh
-// server and is kept for as long as the channel lives.
+// connects to the server again. The listener of a local or dynamic channel does
+// not depend on the ssh server and is kept for as long as the channel lives.
 //
 // A nil listener is returned, with no error, when the channel is already
 // listening on a usable one.
@@ -155,7 +160,7 @@ func (ch *SSHChannel) Listen(serverClient *ssh.Client) (net.Listener, error) {
 	var err error
 
 	switch ch.ChannelType {
-	case "local":
+	case "local", "dynamic":
 		if ch.listener != nil {
 			return nil, nil
 		}
@@ -234,6 +239,12 @@ func (ch *SSHChannel) String() string {
 	ch.mutex.Lock()
 	defer ch.mutex.Unlock()
 
+	// a dynamic channel has no destination to tell about: every connection made
+	// to it carries the address it wants to reach.
+	if ch.Destination == "" {
+		return fmt.Sprintf("[source=%s]", ch.Source)
+	}
+
 	return fmt.Sprintf("[source=%s, destination=%s]", ch.Source, ch.Destination)
 }
 
@@ -243,7 +254,8 @@ func (ch *SSHChannel) String() string {
 // A Tunnel can only be started once: stopping it releases the source endpoints
 // of its channels and the connection to the ssh server for good.
 type Tunnel struct {
-	// Type tells what kind of port forwarding this tunnel will handle: local or remote
+	// Type tells what kind of port forwarding this tunnel will handle: local,
+	// remote or dynamic
 	Type string
 
 	// Ready tells when the Tunnel is ready to accept connections, which is as
@@ -277,6 +289,9 @@ type Tunnel struct {
 	// goroutines that any error they get from that point on is expected.
 	stop     chan struct{}
 	stopOnce sync.Once
+	// socks serves the connections made to the channels of a dynamic tunnel and
+	// is nil on every other kind of tunnel.
+	socks *socks5.Server
 }
 
 // New creates a new instance of Tunnel.
@@ -290,12 +305,14 @@ func New(tunnelType string, server *Server, source, destination []string, config
 	}
 
 	for _, channel := range channels {
-		if channel.Source == "" || channel.Destination == "" {
+		// a dynamic channel has no destination of its own: every connection
+		// made to it carries the address it wants to reach.
+		if channel.Source == "" || (channel.Destination == "" && channel.ChannelType != "dynamic") {
 			return nil, fmt.Errorf("invalid ssh channel: source=%s, destination=%s", channel.Source, channel.Destination)
 		}
 	}
 
-	return &Tunnel{
+	t := &Tunnel{
 		Type:      tunnelType,
 		Ready:     make(chan bool, 1),
 		channels:  channels,
@@ -303,7 +320,13 @@ func New(tunnelType string, server *Server, source, destination []string, config
 		reconnect: make(chan error, 1),
 		done:      make(chan error, 1),
 		stop:      make(chan struct{}),
-	}, nil
+	}
+
+	if tunnelType == "dynamic" {
+		t.socks = newSocksServer(t.dialFromServer)
+	}
+
+	return t, nil
 }
 
 // sshClient returns the connection to the ssh server currently in use, which
@@ -418,10 +441,15 @@ func (t *Tunnel) Listen() error {
 			continue
 		}
 
-		log.WithFields(log.Fields{
-			"source":      ch.Source,
-			"destination": ch.Destination,
-		}).Info("tunnel channel is waiting for connection")
+		fields := log.Fields{"source": ch.Source}
+
+		// a dynamic channel has no destination to tell about: every connection
+		// made to it carries the address it wants to reach.
+		if ch.Destination != "" {
+			fields["destination"] = ch.Destination
+		}
+
+		log.WithFields(fields).Info("tunnel channel is waiting for connection")
 
 		go t.acceptConnections(ch, listener)
 	}
@@ -444,8 +472,8 @@ func (t *Tunnel) closeChannels() {
 // startChannel forwards the given connection, which must have been accepted
 // from the given channel, to the channel destination.
 //
-// On success both connections are handed over to copyConn, which closes them
-// once either side is done. On error conn is left untouched and closing it is
+// On success the connection is handed over to whoever forwards it, which closes
+// it once it is done with it. On error conn is left untouched and closing it is
 // up to the caller.
 func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn) error {
 	var err error
@@ -453,6 +481,20 @@ func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn) error {
 	log.WithFields(log.Fields{
 		"channel": channel,
 	}).Debug("connection established")
+
+	if t.Type == "dynamic" {
+		// the destination is not known yet: the socks server reads it from the
+		// connection itself and takes it from there.
+		//
+		// Whether there is a connection to the ssh server is left for the socks
+		// server to find out, so that a client asking for an address while the
+		// tunnel is reconnecting is told the address could not be reached,
+		// which is an answer it can act on, rather than having its connection
+		// dropped in the middle of the protocol.
+		go t.serveSocks(channel, conn)
+
+		return nil
+	}
 
 	client := t.sshClient()
 	if client == nil {
@@ -482,6 +524,45 @@ func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn) error {
 	}).Debug("tunnel channel has been established")
 
 	return nil
+}
+
+// serveSocks hands the given connection over to the socks server, which reads
+// the address the client wants to reach from it and forwards the connection to
+// that address through the ssh server.
+//
+// The connection belongs to the socks server from this point on: it is closed
+// as soon as the client is done with it, whether the forwarding succeeded or
+// not, or as soon as the tunnel stops, whichever comes first.
+func (t *Tunnel) serveSocks(channel *SSHChannel, conn net.Conn) {
+	// a connection the socks server is still reading a request from is not
+	// bound to anything the tunnel closes on its way out, unlike the ones
+	// already being forwarded, which die with the connection to the ssh server
+	// carrying them. Releasing it here keeps a client that connects and says
+	// nothing from holding a socket, and the goroutine serving it, for as long
+	// as the process lives.
+	served := make(chan struct{})
+	defer close(served)
+
+	go func() {
+		select {
+		case <-t.stop:
+			conn.Close()
+		case <-served:
+		}
+	}()
+
+	err := t.socks.ServeConn(conn)
+	if err == nil {
+		return
+	}
+
+	// a single connection going wrong says nothing about the channel serving
+	// it, which keeps accepting connections either way, so the error is only
+	// worth reporting to whoever is looking into a client that misbehaved.
+	log.WithError(err).WithFields(log.Fields{
+		"channel": channel,
+		"client":  conn.RemoteAddr(),
+	}).Debug("error while serving socks connection")
 }
 
 // Stop cancels the tunnel, closing all connections.
@@ -808,6 +889,14 @@ func expandAddress(address string) string {
 }
 
 func buildSSHChannels(serverName, channelType string, source, destination []string, cfgPath string) ([]*SSHChannel, error) {
+	if channelType == "dynamic" {
+		if len(destination) > 0 {
+			return nil, fmt.Errorf(DestinationNotAllowed)
+		}
+
+		return buildDynamicSSHChannels(serverName, source, cfgPath)
+	}
+
 	// if source and destination were not given, try to find the addresses from the
 	// SSH configuration file.
 	if len(source) == 0 && len(destination) == 0 {
@@ -872,6 +961,32 @@ func buildSSHChannels(serverName, channelType string, source, destination []stri
 	return channels, nil
 }
 
+// buildDynamicSSHChannels creates the channels of a dynamic tunnel, which are
+// made of a source endpoint alone: the destination of every connection made to
+// them is given by the client through the socks protocol.
+//
+// If no source address is given, they are taken from the SSH configuration
+// file.
+func buildDynamicSSHChannels(serverName string, source []string, cfgPath string) ([]*SSHChannel, error) {
+	if len(source) == 0 {
+		fwds, err := getForwards("dynamic", serverName, cfgPath)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, f := range fwds {
+			source = append(source, f.Source)
+		}
+	}
+
+	channels := make([]*SSHChannel, len(source))
+	for i, s := range source {
+		channels[i] = &SSHChannel{ChannelType: "dynamic", Source: expandAddress(s)}
+	}
+
+	return channels, nil
+}
+
 func getForwards(channelType, serverName string, cfgPath string) ([]*ForwardConfig, error) {
 	var fwds []*ForwardConfig
 
@@ -886,6 +1001,8 @@ func getForwards(channelType, serverName string, cfgPath string) ([]*ForwardConf
 		fwds = sh.LocalForwards
 	} else if channelType == "remote" {
 		fwds = sh.RemoteForwards
+	} else if channelType == "dynamic" {
+		fwds = sh.DynamicForwards
 	} else {
 		return nil, fmt.Errorf("could not retrieve forwarding information from ssh configuration file: unsupported channel type %s", channelType)
 	}
