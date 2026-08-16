@@ -3,7 +3,6 @@ package mole_test
 import (
 	"io/ioutil"
 	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/davrodpin/mole/fsutils"
@@ -40,21 +39,6 @@ func TestDetachedInstanceFileLocations(t *testing.T) {
 
 	if _, err := os.Stat(lfl); os.IsNotExist(err) {
 		t.Errorf("log file does not exist: %v", err)
-	}
-
-}
-
-func TestShowLogs(t *testing.T) {
-	id := "TestDetachedInstanceAlreadyRunning"
-
-	os.MkdirAll(filepath.Join(home, ".mole", id), 0755)
-	logFileLocation := filepath.Join(home, ".mole", id, fsutils.InstanceLogFile)
-	ioutil.WriteFile(logFileLocation, []byte("first log message\nsecond log message\nthird log message\n"), 0644)
-
-	err := mole.ShowLogs(id, false)
-
-	if err != nil {
-		t.Errorf("error showing logs: %v", err)
 	}
 
 }

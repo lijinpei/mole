@@ -9,7 +9,6 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/davrodpin/mole/fsutils"
-	ps "github.com/mitchellh/go-ps"
 )
 
 type Formatter interface {
@@ -118,14 +117,5 @@ func (c *Client) Running() (bool, error) {
 		return false, err
 	}
 
-	ps, err := ps.FindProcess(pid)
-	if err != nil {
-		return false, err
-	}
-
-	if ps == nil {
-		return false, nil
-	}
-
-	return true, nil
+	return processExists(pid)
 }

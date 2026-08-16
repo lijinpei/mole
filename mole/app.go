@@ -5,8 +5,6 @@ import (
 	"os"
 
 	"github.com/davrodpin/mole/fsutils"
-
-	"github.com/hpcloud/tail"
 )
 
 // DetachedInstance holds the location to directories and files associated
@@ -51,22 +49,4 @@ func NewDetachedInstance(id string) (*DetachedInstance, error) {
 		LogFile: lfl,
 		PidFile: dirInfo.PidFile,
 	}, nil
-}
-
-// ShowLogs displays all logs messages from a detached applications instance.
-func ShowLogs(id string, follow bool) error {
-	lfl, err := fsutils.GetLogFileLocation(id)
-	if err != nil {
-		return err
-	}
-
-	t, err := tail.TailFile(lfl, tail.Config{Follow: follow})
-	if err != nil {
-		return err
-	}
-	for line := range t.Lines {
-		fmt.Println(line.Text)
-	}
-
-	return nil
 }

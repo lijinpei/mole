@@ -43,7 +43,7 @@ INFO[0000] tunnel channel is waiting for connection      destination="127.0.0.1:
   * [Leveraging LocalForward from SSH configuration file](#leveraging-localforward-from-ssh-configuration-file)
   * [Leveraging RemoteForward from SSH configuration file](#leveraging-remoteforward-from-ssh-configuration-file)
   * [Create multiple tunnels using a single ssh connection](#create-multiple-tunnels-using-a-single-ssh-connection)
-  * [Show logs of any detached mole instance](#show-logs-of-any-detached-mole-instance)
+  * [Read the logs of any detached mole instance](#read-the-logs-of-any-detached-mole-instance)
 
 # Use Cases
 
@@ -332,7 +332,18 @@ INFO[0000] tunnel channel is waiting for connection      destination="192.168.33
 INFO[0000] tunnel channel is waiting for connection      destination="192.168.33.11:80" source="127.0.0.1:9090"
 ```
 
-### Show logs of any detached mole instance
+### Read the logs of any detached mole instance
+
+A detached instance writes its log messages to a file inside the mole home
+directory, named after the instance identifier:
+
+```
+$HOME/.mole/<instance-id>/mole.log
+```
+
+Use `mole show instances` to list the identifiers of the instances currently
+running, then read the file with any tool you like. `tail -f` follows the log
+as it grows, the same way `mole show logs --follow` used to:
 
 ```sh
 $ mole start local \
@@ -344,7 +355,7 @@ $ mole start local \
     --server example
 INFO[0000] instance identifier is afb046da
 INFO[0000] execute "mole stop afb046da" if you like to stop it at any time
-$ mole show logs --follow afb046da
+$ tail -f $HOME/.mole/afb046da/mole.log
 time="2021-09-17T13:57:10-07:00" level=info msg="instance identifier is 1879de9f"
 time="2021-09-17T13:57:10-07:00" level=debug msg="generating an empty config struct"
 time="2021-09-17T13:57:10-07:00" level=debug msg="server: [name=127.0.0.01, address=127.0.0.01:22122, user=mole]"

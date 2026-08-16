@@ -16,11 +16,11 @@ import (
 	"github.com/davrodpin/mole/tunnel"
 
 	"github.com/awnumar/memguard"
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/gofrs/uuid/v5"
-	"github.com/mitchellh/mapstructure"
 	daemon "github.com/sevlyar/go-daemon"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 const (
@@ -455,7 +455,7 @@ func createTunnel(conf *Configuration) (*tunnel.Tunnel, error) {
 	err = s.Key.HandlePassphrase(func() ([]byte, error) {
 		fmt.Printf("The key provided is secured by a password. Please provide it below:\n")
 		fmt.Printf("Password: ")
-		p, err := terminal.ReadPassword(int(syscall.Stdin))
+		p, err := term.ReadPassword(int(syscall.Stdin))
 		fmt.Printf("\n")
 		return p, err
 	})

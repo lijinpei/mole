@@ -5,6 +5,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- Bump all dependencies to their latest versions, which raises the minimum Go version to 1.25
+- Replace the archived `github.com/mitchellh/mapstructure` with the maintained `github.com/go-viper/mapstructure/v2`
+- Replace the archived `github.com/mitchellh/go-ps` with the standard library
+- Replace the deprecated `golang.org/x/crypto/ssh/terminal` with `golang.org/x/term`
+- `show` now fails with "unknown command" instead of silently exiting 0 when given
+  a subcommand it does not have
+
+### Deleted
+- Remove the `show logs` command. A detached instance writes its log to
+  `$HOME/.mole/<instance-id>/mole.log`, which can be read with any tool;
+  `tail -f` replaces `mole show logs --follow`
 
 ## [2.0.0] - 2021-09-28
 ### Added
