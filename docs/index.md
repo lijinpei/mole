@@ -16,6 +16,7 @@ INFO[0000] tunnel channel is waiting for connection      destination="127.0.0.1:
   * [Create multiple tunnels using a single ssh connection](#create-multiple-tunnels-using-a-single-ssh-connection): multiple tunnels can be established using a single connection to a ssh server by specifying different `--destination` flags.
   * [Aliases](#create-an-alias-so-there-is-no-need-to-remember-the-tunnel-settings-afterwards): save your tunnel settings under an alias, so it can be reused later.
   * [SOCKS5 proxy](#start-a-socks5-proxy-with-dynamic-port-forwarding): with `start dynamic` there is no `--destination` to be given, since each client asks for the address it wants to reach and the names are resolved by the jump server.
+  * [Reverse SOCKS5 proxy](#expose-a-socks5-proxy-with-reverse-dynamic-port-forwarding): with `start reverse-dynamic` the proxy is served on an endpoint of the jump server instead, so whoever can reach that endpoint reaches every service this computer can, again without a `--destination` to be given.
   * Leverage the SSH Config File: use some options (e.g. user name, identity key and port), specified in *$HOME/.ssh/config* whenever possible, so there is no need to have the same SSH server configuration in multiple places.
   * Resiliency! Then tunnel will never go down if you don't want to:
     * Idle clients do not get disconnected from the ssh server since Mole keeps sending synthetic packets acting as a keep alive mechanism. 
@@ -29,6 +30,7 @@ INFO[0000] tunnel channel is waiting for connection      destination="127.0.0.1:
   * [Access a service that is listening on a non-routable network](#access-a-service-that-is-listening-on-a-non-routable-network)
   * [Expose a service to someone outside your network](#expose-a-service-to-someone-outside-your-network)
   * [Reach many services without knowing their addresses upfront](#reach-many-services-without-knowing-their-addresses-upfront)
+  * [Expose many services to someone outside your network](#expose-many-services-to-someone-outside-your-network)
 * [Installation](#installation)
   * [Linux and Mac](#linux-and-mac)
   * [Homebrew](#or-if-you-prefer-install-it-through-homebrew)
@@ -46,6 +48,8 @@ INFO[0000] tunnel channel is waiting for connection      destination="127.0.0.1:
   * [Leveraging RemoteForward from SSH configuration file](#leveraging-remoteforward-from-ssh-configuration-file)
   * [Start a SOCKS5 proxy with dynamic port forwarding](#start-a-socks5-proxy-with-dynamic-port-forwarding)
   * [Leveraging DynamicForward from SSH configuration file](#leveraging-dynamicforward-from-ssh-configuration-file)
+  * [Expose a SOCKS5 proxy with reverse dynamic port forwarding](#expose-a-socks5-proxy-with-reverse-dynamic-port-forwarding)
+  * [Leveraging RemoteForward from SSH configuration file for reverse dynamic forwarding](#leveraging-remoteforward-from-ssh-configuration-file-for-reverse-dynamic-forwarding)
   * [Create multiple tunnels using a single ssh connection](#create-multiple-tunnels-using-a-single-ssh-connection)
   * [Read the logs of any detached mole instance](#read-the-logs-of-any-detached-mole-instance)
 
@@ -212,6 +216,60 @@ $ curl --socks5-hostname 127.0.0.1:1080 http://intranet.example
 Only the `CONNECT` command is supported, since a ssh tunnel carries tcp alone,
 and no authentication is required to use the proxy, so the source endpoint
 should be kept on an address only trusted clients can reach.
+
+## Expose many services to someone outside your network
+
+The other way around, a remote tunnel has to be told what it exposes, which
+means one tunnel per service and knowing them all upfront.
+
+**Mole** can instead serve the **SOCKS5 proxy** on the **jump server**, so that
+anyone able to reach that endpoint can ask, connection by connection, for
+whatever address they want to reach, and every one of them is reached from the
+computer running **Mole**. Host names are resolved by that computer, since they
+name what only this side of the tunnel can reach.
+
+```ascii
++---------------------+         +----------------------+
+|  Computer           |         |   Jump Server        |
+|                     |         |                      |
+|       mole  --------+---------+-> (172.17.0.100:22)  |
+|         |           |  tunnel |      ssh server      |
+|         |           |         |          |           |
+|         | forward   |         |          | serve     |
+|        \ /          |         |         \ /          |
+|  intranet.example   |         |   socks5 proxy       |
+|  (192.168.1.1:80)   |         |   (127.0.0.1:1080)   |
+|                     |         |    source address    |
++---------------------+         |         / \          |
+                                |          | connect   |
+                                |       browser        |
+                                +----------------------+
+```
+
+```sh
+$ mole start reverse-dynamic \
+  --source 127.0.0.1:1080 \
+  --server user@172.17.0.100
+```
+
+Any client that speaks SOCKS5 can then reach this side of the tunnel through
+`127.0.0.1:1080` **on the jump server**:
+
+```sh
+$ curl --socks5-hostname 127.0.0.1:1080 http://intranet.example
+```
+
+Only the `CONNECT` command is supported here as well, and no authentication is
+required to use the proxy, so whoever reaches the source endpoint reaches
+everything the computer running **Mole** can.
+
+Which address that endpoint ends up bound to is the **jump server**'s decision
+rather than Mole's, and `--source` is only what gets asked for: `sshd` keeps the
+endpoint on the loopback address unless `GatewayPorts` says otherwise, so by
+default the proxy is reachable from the jump server itself alone, an address
+asked for outside the loopback is quietly narrowed back to it, and with
+`GatewayPorts yes` every endpoint is bound to all interfaces even when a loopback
+address is the one asked for.
 
 # Installation
 
@@ -399,6 +457,42 @@ Host example
   DynamicForward 1080
   IdentityFile test-env/ssh-server/keys/key
 $ mole start dynamic --server example
+INFO[0000] tunnel channel is waiting for connection      source="127.0.0.1:1080"
+```
+
+### Expose a SOCKS5 proxy with reverse dynamic port forwarding
+
+The proxy is served on the jump server, and no destination is given: each client
+asks for the address it wants to reach, which is then reached from the machine
+running mole, where the name is also resolved.
+
+```sh
+$ mole start reverse-dynamic \
+    --source 127.0.0.1:1080 \
+    --server example
+INFO[0000] tunnel channel is waiting for connection      source="127.0.0.1:1080"
+```
+
+`mole` keeps running in the foreground, so from the jump server:
+
+```sh
+$ curl --socks5-hostname 127.0.0.1:1080 http://192.168.33.11
+```
+
+### Leveraging RemoteForward from SSH configuration file for reverse dynamic forwarding
+
+A `RemoteForward` naming a source endpoint alone, with no destination, is what
+asks for a reverse dynamic forward, the same way `ssh -R 1080` does.
+
+```sh
+$ cat ~/.ssh/config
+Host example
+  User mole
+  Hostname 127.0.0.1
+  Port 22122
+  RemoteForward 1080
+  IdentityFile test-env/ssh-server/keys/key
+$ mole start reverse-dynamic --server example
 INFO[0000] tunnel channel is waiting for connection      source="127.0.0.1:1080"
 ```
 

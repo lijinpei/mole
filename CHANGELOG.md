@@ -14,8 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `DynamicForward` is read from the SSH config file when no `--source` is
   given. Only the `CONNECT` command is served, since a ssh tunnel carries tcp
   alone
+- Reverse dynamic port forwarding, through the new `start reverse-dynamic` and
+  `add alias reverse-dynamic` commands, which ask the ssh server to listen on a
+  source endpoint and serve a SOCKS5 proxy on it, reaching every address its
+  clients ask for from the machine running mole. Host names are resolved there
+  as well, since they name what only that side can reach, and a `RemoteForward`
+  carrying a source endpoint alone is read from the SSH config file when no
+  `--source` is given, the same way `ssh -R 1080` asks for one
 
 ### Fixed
+- A tunnel listening on the ssh server no longer turns a source address naming a
+  host into `0.0.0.0`. The endpoint was taken from the listener, which reports
+  the address it could parse rather than the one it asked for, so a `--source
+  localhost:8080` was reported as `0.0.0.0:8080` and every reconnection asked
+  the server to listen on every interface instead of on the address it was told
 - Detached instances no longer lose the last two command line arguments. The id
   argument was written over them instead of after them, so `start alias <name>
   --detach` reached the child process without the alias name and
@@ -45,6 +57,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - CI runs the build and the test suite on windows as well as linux
+- The ssh server used by the test suite serves the endpoints it is asked to
+  forward instead of replying with a port it never listens on, which is what a
+  remote or a reverse dynamic tunnel needs to be reached at all. The
+  `github.com/phayes/freeport` dependency went with the port it was picking
 - Bump all dependencies to their latest versions, which raises the minimum Go version to 1.25
 - Replace the archived `github.com/mitchellh/mapstructure` with the maintained `github.com/go-viper/mapstructure/v2`
 - Replace the archived `github.com/mitchellh/go-ps` with the standard library

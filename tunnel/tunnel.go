@@ -22,10 +22,11 @@ const (
 	HostMissing        = "server host has to be provided as part of the server address"
 	RandomPortAddress  = "127.0.0.1:0"
 	NoDestinationGiven = "cannot create a tunnel without at least one remote address"
-	// DestinationNotAllowed is the error given when a dynamic tunnel is created
-	// with destination addresses, which it has no use for: the destination of
-	// each of its connections is asked for by the client that made it.
-	DestinationNotAllowed = "cannot create a dynamic tunnel with destination addresses"
+	// DestinationNotAllowed is the error given when a dynamic or a reverse
+	// dynamic tunnel is created with destination addresses, which it has no use
+	// for: the destination of each of its connections is asked for by the client
+	// that made it.
+	DestinationNotAllowed = "cannot create a %s tunnel with destination addresses"
 )
 
 // Server holds the SSH Server attributes used for the client to connect to it.
@@ -131,23 +132,40 @@ type SSHChannel struct {
 	Source      string
 	Destination string
 
-	// the listener of a remote channel is replaced whenever the tunnel
-	// reconnects to the ssh server, while everything else keeps running, so
-	// the state below is only touched while holding the mutex.
+	// the listener of a channel that listens on the ssh server is replaced
+	// whenever the tunnel reconnects to it, while everything else keeps running,
+	// so the state below is only touched while holding the mutex.
 	mutex    sync.Mutex
 	listener net.Listener
-	// client is the connection to the ssh server the listener of a remote
-	// channel was created on.
+	// client is the connection to the ssh server the listener of a remote or
+	// reverse dynamic channel was created on.
 	client *ssh.Client
+}
+
+// socksChannel tells whether the channels of the given type serve a socks proxy
+// on the connections made to them, which is how a dynamic and a reverse dynamic
+// channel are told the address each of those connections wants to reach: they
+// have no destination of their own.
+func socksChannel(channelType string) bool {
+	return channelType == "dynamic" || channelType == "reverse-dynamic"
+}
+
+// serverListener tells whether the channels of the given type listen on the ssh
+// server rather than on the machine the tunnel runs on, which is the case of a
+// remote and of a reverse dynamic channel: their listeners are created on the
+// connection to the ssh server and die with it.
+func serverListener(channelType string) bool {
+	return channelType == "remote" || channelType == "reverse-dynamic"
 }
 
 // Listen creates the listener the channel accepts connections from, unless it
 // already has a usable one, and returns it.
 //
-// The listener of a remote channel is created on the given connection to the
-// ssh server and dies with it, so a new one is created every time the tunnel
-// connects to the server again. The listener of a local or dynamic channel does
-// not depend on the ssh server and is kept for as long as the channel lives.
+// The listener of a remote or reverse dynamic channel is created on the given
+// connection to the ssh server and dies with it, so a new one is created every
+// time the tunnel connects to the server again. The listener of a local or
+// dynamic channel does not depend on the ssh server and is kept for as long as
+// the channel lives.
 //
 // A nil listener is returned, with no error, when the channel is already
 // listening on a usable one.
@@ -165,7 +183,7 @@ func (ch *SSHChannel) Listen(serverClient *ssh.Client) (net.Listener, error) {
 		}
 
 		l, err = net.Listen("tcp", ch.Source)
-	case "remote":
+	case "remote", "reverse-dynamic":
 		if ch.listener != nil && ch.client == serverClient {
 			return nil, nil
 		}
@@ -188,9 +206,31 @@ func (ch *SSHChannel) Listen(serverClient *ssh.Client) (net.Listener, error) {
 
 	// update the endpoint value with assigned port for the cases where the user
 	// haven't explicitily specified one
-	ch.Source = l.Addr().String()
+	ch.Source = boundSource(ch.Source, l.Addr())
 
 	return l, nil
+}
+
+// boundSource returns the endpoint a channel listens on: the address it was
+// given, carrying the port that was assigned to it when it asked for any.
+//
+// The address is kept as it was given because the listener of a channel
+// listening on the ssh server reports the one it could make sense of rather
+// than the one it asked for: a source naming a host comes back as 0.0.0.0,
+// which would have every reconnection ask the server to listen on every
+// interface instead of on the address it was told.
+func boundSource(source string, bound net.Addr) string {
+	host, port, err := net.SplitHostPort(source)
+	if err != nil || port != "0" {
+		return source
+	}
+
+	_, assigned, err := net.SplitHostPort(bound.String())
+	if err != nil {
+		return source
+	}
+
+	return net.JoinHostPort(host, assigned)
 }
 
 // Close closes the channel listener, releasing the source endpoint and
@@ -205,6 +245,15 @@ func (ch *SSHChannel) Close() error {
 	}
 
 	return ch.listener.Close()
+}
+
+// source returns the endpoint the channel listens on, which carries the port
+// assigned to it once it is listening.
+func (ch *SSHChannel) source() string {
+	ch.mutex.Lock()
+	defer ch.mutex.Unlock()
+
+	return ch.Source
 }
 
 // address returns the address the channel is listening on, which is empty
@@ -238,8 +287,8 @@ func (ch *SSHChannel) String() string {
 	ch.mutex.Lock()
 	defer ch.mutex.Unlock()
 
-	// a dynamic channel has no destination to tell about: every connection made
-	// to it carries the address it wants to reach.
+	// a dynamic or reverse dynamic channel has no destination to tell about:
+	// every connection made to it carries the address it wants to reach.
 	if ch.Destination == "" {
 		return fmt.Sprintf("[source=%s]", ch.Source)
 	}
@@ -254,7 +303,7 @@ func (ch *SSHChannel) String() string {
 // of its channels and the connection to the ssh server for good.
 type Tunnel struct {
 	// Type tells what kind of port forwarding this tunnel will handle: local,
-	// remote or dynamic
+	// remote, dynamic or reverse-dynamic
 	Type string
 
 	// Ready tells when the Tunnel is ready to accept connections, which is as
@@ -298,15 +347,25 @@ func New(tunnelType string, server *Server, source, destination []string, config
 	var channels []*SSHChannel
 	var err error
 
+	// the type is checked before anything is built from it so that a tunnel
+	// asked for by a name that does not exist, as an alias carrying a typo does,
+	// is told about it instead of failing on whatever the channels of an unknown
+	// type end up missing.
+	switch tunnelType {
+	case "local", "remote", "dynamic", "reverse-dynamic":
+	default:
+		return nil, fmt.Errorf("unsupported tunnel type %s", tunnelType)
+	}
+
 	channels, err = buildSSHChannels(server.Name, tunnelType, source, destination, config)
 	if err != nil {
 		return nil, err
 	}
 
 	for _, channel := range channels {
-		// a dynamic channel has no destination of its own: every connection
-		// made to it carries the address it wants to reach.
-		if channel.Source == "" || (channel.Destination == "" && channel.ChannelType != "dynamic") {
+		// a dynamic or reverse dynamic channel has no destination of its own:
+		// every connection made to it carries the address it wants to reach.
+		if channel.Source == "" || (channel.Destination == "" && !socksChannel(channel.ChannelType)) {
 			return nil, fmt.Errorf("invalid ssh channel: source=%s, destination=%s", channel.Source, channel.Destination)
 		}
 	}
@@ -433,10 +492,11 @@ func (t *Tunnel) reconnectionDisabled() bool {
 //
 // It is called again on every reconnection to the ssh server: a local channel
 // keeps the listener it already has, and with it the goroutine serving it,
-// while a remote one gets a new listener, and a goroutine to serve it, since
-// the previous listener died with the connection it was created on.
+// while a channel listening on the ssh server gets a new listener, and a
+// goroutine to serve it, since the previous listener died with the connection
+// it was created on.
 func (t *Tunnel) Listen() error {
-	client := t.sshClient()
+	client, disconnected := t.sshConnection()
 
 	for _, ch := range t.channels {
 		listener, err := ch.Listen(client)
@@ -448,17 +508,27 @@ func (t *Tunnel) Listen() error {
 			continue
 		}
 
-		fields := log.Fields{"source": ch.Source}
+		fields := log.Fields{"source": ch.source()}
 
-		// a dynamic channel has no destination to tell about: every connection
-		// made to it carries the address it wants to reach.
+		// a dynamic or reverse dynamic channel has no destination to tell about:
+		// every connection made to it carries the address it wants to reach.
 		if ch.Destination != "" {
 			fields["destination"] = ch.Destination
 		}
 
 		log.WithFields(fields).Info("tunnel channel is waiting for connection")
 
-		go t.acceptConnections(ch, listener)
+		// a connection accepted from a listener created on the ssh server lives
+		// on the connection that listener was created on, which is the one just
+		// used. The listener of a local or dynamic channel outlives every
+		// connection to the ssh server, so nothing accepted from it is bound to
+		// one before an address is reached through it.
+		var listenerDisconnected <-chan struct{}
+		if serverListener(ch.ChannelType) {
+			listenerDisconnected = disconnected
+		}
+
+		go t.acceptConnections(ch, listener, listenerDisconnected)
 	}
 
 	return nil
@@ -479,42 +549,57 @@ func (t *Tunnel) closeChannels() {
 // startChannel forwards the given connection, which must have been accepted
 // from the given channel, to the channel destination.
 //
+// disconnected tells when the connection to the ssh server the given connection
+// came from is gone, and is nil for a connection that came from a listener of
+// its own rather than from the ssh server.
+//
 // On success the connection is handed over to whoever forwards it, which closes
 // it once it is done with it. On error conn is left untouched and closing it is
 // up to the caller.
-func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn) error {
+func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn, disconnected <-chan struct{}) error {
+	var destinationConn net.Conn
 	var err error
 
 	log.WithFields(log.Fields{
 		"channel": channel,
 	}).Debug("connection established")
 
-	if t.Type == "dynamic" {
+	switch t.Type {
+	case "dynamic":
 		// the destination is not known yet: the socks server reads it from the
-		// connection itself and takes it from there.
+		// connection itself and reaches it from the ssh server.
 		//
 		// Whether there is a connection to the ssh server is left for the socks
 		// server to find out, so that a client asking for an address while the
 		// tunnel is reconnecting is told the address could not be reached,
 		// which is an answer it can act on, rather than having its connection
-		// dropped in the middle of the protocol.
-		go t.serveSocks(channel, conn)
+		// dropped in the middle of the protocol. Nothing carries the connection
+		// until then, which is what the missing signal says.
+		go t.serveSocks(channel, conn, nil, t.sshDial)
 
 		return nil
-	}
+	case "reverse-dynamic":
+		// the destination is not known yet either, and is reached from the
+		// machine the tunnel runs on rather than from the ssh server: the client
+		// asking for it is the one on the other side.
+		go t.serveSocks(channel, conn, disconnected, netDial)
 
-	client, disconnected := t.sshConnection()
-	if client == nil {
-		return fmt.Errorf("tunnel channel can't be established: missing connection to the ssh server")
-	}
+		return nil
+	case "local":
+		var client *ssh.Client
 
-	var destinationConn net.Conn
+		// the connection made to the source endpoint is a plain socket that
+		// outlives any connection to the ssh server, so what carries it is the
+		// one the destination is about to be dialed from.
+		client, disconnected = t.sshConnection()
+		if client == nil {
+			return fmt.Errorf("tunnel channel can't be established: missing connection to the ssh server")
+		}
 
-	if t.Type == "local" {
 		destinationConn, err = client.Dial("tcp", channel.Destination)
-	} else if t.Type == "remote" {
+	case "remote":
 		destinationConn, err = net.Dial("tcp", channel.Destination)
-	} else {
+	default:
 		return fmt.Errorf("unknown tunnel type %s", t.Type)
 	}
 
@@ -532,10 +617,10 @@ func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn) error {
 	return nil
 }
 
-// forward carries data both ways between the given connections, which must
-// have been established on the connection to the ssh server the given channel
-// tells about, until both directions are done, that connection is gone or the
-// tunnel stops, whichever comes first, and closes both of them on its way out.
+// forward carries data both ways between the given connections, one of which
+// lives on the connection to the ssh server whose loss is told by disconnected,
+// until both directions are done, that connection is gone or the tunnel stops,
+// whichever comes first, and closes both of them on its way out.
 func (t *Tunnel) forward(channel *SSHChannel, conn, destinationConn net.Conn, disconnected <-chan struct{}) {
 	// one of the two connections lives on the connection to the ssh server and
 	// dies with it, which the direction reading from it sees as the end of the
@@ -578,39 +663,52 @@ func (t *Tunnel) forward(channel *SSHChannel, conn, destinationConn net.Conn, di
 
 // serveSocks hands the given connection over to the socks server, which reads
 // the address the client wants to reach from it and forwards the connection to
-// that address through the ssh server.
+// that address through the given dialer.
+//
+// disconnected tells when the connection to the ssh server the given connection
+// came from is gone, and is nil for a connection that did not come from one: a
+// dynamic channel only learns what carries a connection when the address it
+// asked for is reached.
 //
 // The connection belongs to the socks server from this point on: it is closed
 // as soon as the client is done with it, whether the forwarding succeeded or
 // not, as soon as the connection to the ssh server carrying it is gone, or as
 // soon as the tunnel stops, whichever comes first.
-func (t *Tunnel) serveSocks(channel *SSHChannel, conn net.Conn) {
+func (t *Tunnel) serveSocks(channel *SSHChannel, conn net.Conn, disconnected <-chan struct{}, dialer socksDialer) {
 	served := make(chan struct{})
 	defer close(served)
 
-	// dialed carries the signal telling when the connection to the ssh server
-	// the address asked for was reached through is gone, which only exists once
-	// the socks server has asked for one.
-	dialed := make(chan (<-chan struct{}), 1)
+	// dialed carries what the socks server reached the address asked for with,
+	// which only exists once it has been asked for one.
+	dialed := make(chan dialedConn, 1)
 
-	// a connection the socks server is still reading a request from is bound to
-	// nothing yet, so it is only released when the tunnel stops, which keeps a
+	// a connection the socks server is still reading a request from has nothing
+	// dialed on its behalf yet, so it is only released when the tunnel stops, or
+	// when the connection to the ssh server it came from is gone, which keeps a
 	// client that connects and says nothing from holding a socket, and the
-	// goroutine serving it, for as long as the process lives. A client that has
-	// not asked for anything is left alone while the tunnel reconnects, so that
-	// it is still told the address could not be reached rather than having its
-	// connection dropped in the middle of the protocol.
+	// goroutine serving it, for as long as the process lives. A client that
+	// reached a dynamic channel is left alone while the tunnel reconnects, so
+	// that it is still told the address could not be reached rather than having
+	// its connection dropped in the middle of the protocol.
 	//
-	// One already being forwarded is released as soon as the connection to the
-	// ssh server carrying it is gone as well, since it can't be carried any
-	// further: the direction bringing the answer back sees the end of its
-	// stream, while the one reading from the client would be left waiting on a
-	// peer that has no reason to ever speak again.
+	// Both ends of one already being forwarded are released as soon as the
+	// connection to the ssh server carrying them is gone, since neither can be
+	// carried any further: the direction reading from the ssh side sees the end
+	// of its stream, while the opposite one would be left waiting on a peer that
+	// has no reason to ever speak again.
 	go func() {
-		var disconnected <-chan struct{}
+		var target net.Conn
 
 		select {
-		case disconnected = <-dialed:
+		case d := <-dialed:
+			target = d.conn
+
+			if disconnected == nil {
+				disconnected = d.disconnected
+			}
+		case <-disconnected:
+			conn.Close()
+			return
 		case <-t.stop:
 			conn.Close()
 			return
@@ -626,12 +724,13 @@ func (t *Tunnel) serveSocks(channel *SSHChannel, conn net.Conn) {
 		}
 
 		conn.Close()
+		target.Close()
 	}()
 
-	// the socks server is made for this connection alone, so that the address
-	// it is asked for is reached through a connection to the ssh server this
-	// one can be bound to.
-	err := newSocksServer(t.socksDial(dialed)).ServeConn(conn)
+	// the socks server is made for this connection alone, so that what it
+	// reaches the address asked for with, and the connection to the ssh server
+	// it was reached through, are known to whoever is serving this one.
+	err := newSocksServer(dialer(dialed)).ServeConn(conn)
 	if err == nil {
 		return
 	}
@@ -772,7 +871,10 @@ func (t *Tunnel) connect() {
 
 // acceptConnections forwards every connection made to the given listener, which
 // must be the one the given channel is listening on, until it is closed.
-func (t *Tunnel) acceptConnections(channel *SSHChannel, listener net.Listener) {
+//
+// disconnected tells when the connection to the ssh server the listener was
+// created on is gone, and is nil for a listener that was not created on one.
+func (t *Tunnel) acceptConnections(channel *SSHChannel, listener net.Listener, disconnected <-chan struct{}) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
@@ -783,7 +885,7 @@ func (t *Tunnel) acceptConnections(channel *SSHChannel, listener net.Listener) {
 		// failing to forward a single connection is not fatal to the channel:
 		// the listener is still valid and the connection to the ssh server may
 		// still be reestablished by the reconnection logic.
-		if err := t.startChannel(channel, conn); err != nil {
+		if err := t.startChannel(channel, conn, disconnected); err != nil {
 			conn.Close()
 
 			log.WithError(err).WithFields(log.Fields{
@@ -806,9 +908,9 @@ func (t *Tunnel) stopServing(channel *SSHChannel, err error) {
 		return
 	}
 
-	if channel.ChannelType == "remote" {
-		// the listener of a remote channel dies with the connection to the ssh
-		// server it was created on, and a new one is created, and served, as
+	if serverListener(channel.ChannelType) {
+		// the listener of a channel listening on the ssh server dies with the
+		// connection it was created on, and a new one is created, and served, as
 		// soon as the tunnel connects to the server again.
 		log.WithError(err).WithFields(log.Fields{
 			"channel": channel,
@@ -1003,12 +1105,12 @@ func expandAddress(address string) string {
 }
 
 func buildSSHChannels(serverName, channelType string, source, destination []string, cfgPath string) ([]*SSHChannel, error) {
-	if channelType == "dynamic" {
+	if socksChannel(channelType) {
 		if len(destination) > 0 {
-			return nil, fmt.Errorf(DestinationNotAllowed)
+			return nil, fmt.Errorf(DestinationNotAllowed, channelType)
 		}
 
-		return buildDynamicSSHChannels(serverName, source, cfgPath)
+		return buildDynamicSSHChannels(serverName, channelType, source, cfgPath)
 	}
 
 	// if source and destination were not given, try to find the addresses from the
@@ -1075,15 +1177,16 @@ func buildSSHChannels(serverName, channelType string, source, destination []stri
 	return channels, nil
 }
 
-// buildDynamicSSHChannels creates the channels of a dynamic tunnel, which are
-// made of a source endpoint alone: the destination of every connection made to
-// them is given by the client through the socks protocol.
+// buildDynamicSSHChannels creates the channels of a dynamic or of a reverse
+// dynamic tunnel, which are made of a source endpoint alone: the destination of
+// every connection made to them is given by the client through the socks
+// protocol.
 //
 // If no source address is given, they are taken from the SSH configuration
 // file.
-func buildDynamicSSHChannels(serverName string, source []string, cfgPath string) ([]*SSHChannel, error) {
+func buildDynamicSSHChannels(serverName, channelType string, source []string, cfgPath string) ([]*SSHChannel, error) {
 	if len(source) == 0 {
-		fwds, err := getForwards("dynamic", serverName, cfgPath)
+		fwds, err := getForwards(channelType, serverName, cfgPath)
 		if err != nil {
 			return nil, err
 		}
@@ -1095,7 +1198,7 @@ func buildDynamicSSHChannels(serverName string, source []string, cfgPath string)
 
 	channels := make([]*SSHChannel, len(source))
 	for i, s := range source {
-		channels[i] = &SSHChannel{ChannelType: "dynamic", Source: expandAddress(s)}
+		channels[i] = &SSHChannel{ChannelType: channelType, Source: expandAddress(s)}
 	}
 
 	return channels, nil
@@ -1117,12 +1220,19 @@ func getForwards(channelType, serverName string, cfgPath string) ([]*ForwardConf
 		fwds = sh.RemoteForwards
 	} else if channelType == "dynamic" {
 		fwds = sh.DynamicForwards
+	} else if channelType == "reverse-dynamic" {
+		fwds = sh.ReverseDynamicForwards
 	} else {
 		return nil, fmt.Errorf("could not retrieve forwarding information from ssh configuration file: unsupported channel type %s", channelType)
 	}
 
+	// the kind of forward is part of the message because a single setting can
+	// hold more than one of them: a RemoteForward naming a destination is a
+	// remote forward while one carrying a source endpoint alone is a reverse
+	// dynamic forward, so a host can have what is being looked for missing while
+	// its configuration is neither missing nor invalid.
 	if fwds == nil {
-		return nil, fmt.Errorf("forward config could not be found or has invalid syntax for host %s", serverName)
+		return nil, fmt.Errorf("%s forward config could not be found or has invalid syntax for host %s", channelType, serverName)
 	}
 
 	return fwds, nil

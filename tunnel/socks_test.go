@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -30,7 +31,7 @@ const (
 )
 
 func TestDynamicTunnel(t *testing.T) {
-	tun, ssh, started := prepareDynamicTunnel(t, []string{"127.0.0.1:0"}, 3)
+	tun, ssh, started := prepareDynamicTunnel(t, "dynamic", []string{"127.0.0.1:0"}, 3)
 	defer ssh.Close()
 	defer stopDynamicTunnel(t, tun, started)
 
@@ -59,7 +60,7 @@ func TestDynamicTunnel(t *testing.T) {
 }
 
 func TestDynamicTunnelMultipleSources(t *testing.T) {
-	tun, ssh, started := prepareDynamicTunnel(t, []string{"127.0.0.1:0", "127.0.0.1:0"}, 3)
+	tun, ssh, started := prepareDynamicTunnel(t, "dynamic", []string{"127.0.0.1:0", "127.0.0.1:0"}, 3)
 	defer ssh.Close()
 	defer stopDynamicTunnel(t, tun, started)
 
@@ -80,7 +81,7 @@ func TestDynamicTunnelMultipleSources(t *testing.T) {
 }
 
 func TestDynamicTunnelReconnectsToSSHServer(t *testing.T) {
-	tun, ssh, started := prepareDynamicTunnel(t, []string{"127.0.0.1:0"}, 3)
+	tun, ssh, started := prepareDynamicTunnel(t, "dynamic", []string{"127.0.0.1:0"}, 3)
 	defer stopDynamicTunnel(t, tun, started)
 
 	waitForDynamicTunnel(t, tun)
@@ -119,7 +120,7 @@ func TestDynamicTunnelReconnectsToSSHServer(t *testing.T) {
 }
 
 func TestDynamicTunnelRefusesUDPAssociate(t *testing.T) {
-	tun, ssh, started := prepareDynamicTunnel(t, []string{"127.0.0.1:0"}, 3)
+	tun, ssh, started := prepareDynamicTunnel(t, "dynamic", []string{"127.0.0.1:0"}, 3)
 	defer ssh.Close()
 	defer stopDynamicTunnel(t, tun, started)
 
@@ -150,7 +151,7 @@ func TestDynamicTunnelRefusesUDPAssociate(t *testing.T) {
 }
 
 func TestDynamicTunnelReleasesIdleConnectionsOnStop(t *testing.T) {
-	tun, ssh, started := prepareDynamicTunnel(t, []string{"127.0.0.1:0"}, 3)
+	tun, ssh, started := prepareDynamicTunnel(t, "dynamic", []string{"127.0.0.1:0"}, 3)
 	defer ssh.Close()
 
 	waitForDynamicTunnel(t, tun)
@@ -200,7 +201,7 @@ func TestDynamicTunnelReleasesConnectionsOnReconnection(t *testing.T) {
 	}
 	defer endpoint.Close()
 
-	tun, ssh, started := prepareDynamicTunnel(t, []string{"127.0.0.1:0"}, 3)
+	tun, ssh, started := prepareDynamicTunnel(t, "dynamic", []string{"127.0.0.1:0"}, 3)
 	defer ssh.Close()
 	defer stopDynamicTunnel(t, tun, started)
 
@@ -237,7 +238,7 @@ func TestDynamicTunnelReleasesConnectionsOnReconnection(t *testing.T) {
 }
 
 func TestDynamicTunnelRepliesWhileThereIsNoSSHConnection(t *testing.T) {
-	tun, ssh, started := prepareDynamicTunnel(t, []string{"127.0.0.1:0"}, 3)
+	tun, ssh, started := prepareDynamicTunnel(t, "dynamic", []string{"127.0.0.1:0"}, 3)
 	defer ssh.Close()
 	defer stopDynamicTunnel(t, tun, started)
 
@@ -270,6 +271,242 @@ func TestDynamicTunnelRepliesWhileThereIsNoSSHConnection(t *testing.T) {
 
 	if reply[1] == socksSucceeded {
 		t.Errorf("expected the connect request to fail while the tunnel has no connection to the ssh server")
+	}
+}
+
+// A reverse dynamic tunnel serves its socks proxy on an endpoint of the ssh
+// server, and reaches the addresses its clients ask for from the machine it
+// runs on, which is the opposite of what a dynamic tunnel does.
+func TestReverseDynamicTunnel(t *testing.T) {
+	tun, ssh, started := prepareDynamicTunnel(t, "reverse-dynamic", []string{"127.0.0.1:0"}, 3)
+	defer ssh.Close()
+	defer stopDynamicTunnel(t, tun, started)
+
+	waitForDynamicTunnel(t, tun)
+
+	endpoint, server := createHttpServer()
+	defer server.Close()
+
+	_, port, err := net.SplitHostPort(endpoint.Addr().String())
+	if err != nil {
+		t.Fatalf("error while reading the address of the http server: %v", err)
+	}
+
+	// the address is asked for both as an ip and as a name so that the two
+	// kinds of address a socks client can send are covered. The name is resolved
+	// here, since it names what this side can reach.
+	addresses := []string{
+		endpoint.Addr().String(),
+		net.JoinHostPort("localhost", port),
+	}
+
+	for _, address := range addresses {
+		if err := validateDynamicTunnelConnectivity("PQR", address, tun); err != nil {
+			t.Errorf("error while reaching %s through the tunnel: %v", address, err)
+		}
+	}
+}
+
+// The address a reverse dynamic tunnel is asked for is reached from the machine
+// the tunnel runs on, which is the whole of what tells it apart from a dynamic
+// one: the client sits on the other side of the ssh server, and what it is
+// after is here, so the ssh server is asked for nothing beyond carrying the
+// connection.
+func TestReverseDynamicTunnelReachesTheAddressFromHere(t *testing.T) {
+	endpoint, server := createHttpServer()
+	defer server.Close()
+
+	address := endpoint.Addr().String()
+
+	tests := []struct {
+		tunnelType string
+		// reached tells how many addresses the ssh server is asked to reach on
+		// behalf of a single connection made to the proxy.
+		reached int64
+	}{
+		{tunnelType: "dynamic", reached: 1},
+		{tunnelType: "reverse-dynamic", reached: 0},
+	}
+
+	for _, test := range tests {
+		func() {
+			tun, ssh, started := prepareDynamicTunnel(t, test.tunnelType, []string{"127.0.0.1:0"}, 3)
+			defer ssh.Close()
+			defer stopDynamicTunnel(t, tun, started)
+
+			waitForDynamicTunnel(t, tun)
+
+			asked := addressesReached.Load()
+
+			if err := validateDynamicTunnelConnectivity("BCD", address, tun); err != nil {
+				t.Errorf("error while reaching the endpoint through the %s tunnel: %v", test.tunnelType, err)
+				return
+			}
+
+			if reached := addressesReached.Load() - asked; reached != test.reached {
+				t.Errorf("expected the ssh server of a %s tunnel to be asked to reach %d addresses, but it was asked for %d", test.tunnelType, test.reached, reached)
+			}
+		}()
+	}
+}
+
+// A source naming a host has to be kept the way it was given: the listener of a
+// channel listening on the ssh server reports 0.0.0.0 for an address it could
+// not parse, and a tunnel that took that for its endpoint would ask the server
+// to listen on every interface as soon as it reconnected, turning a proxy meant
+// for the jump server itself into one the whole network can reach.
+func TestReverseDynamicTunnelKeepsTheSourceItWasGiven(t *testing.T) {
+	tun, ssh, started := prepareDynamicTunnel(t, "reverse-dynamic", []string{"localhost:0"}, 3)
+	defer ssh.Close()
+	defer stopDynamicTunnel(t, tun, started)
+
+	waitForDynamicTunnel(t, tun)
+
+	source := tun.channels[0].source()
+
+	host, port, err := net.SplitHostPort(source)
+	if err != nil {
+		t.Fatalf("error while reading the source endpoint of the channel: %v", err)
+	}
+
+	if host != "localhost" {
+		t.Errorf("expected the channel to keep listening on localhost, but its source is %s", source)
+	}
+
+	if port == "0" {
+		t.Errorf("expected the channel to carry the port it was assigned, but its source is %s", source)
+	}
+
+	// the endpoint the tunnel asks for again is the one it is already known by,
+	// so the address has to survive the reconnection as well.
+	tun.sshClient().Close()
+
+	waitForDynamicTunnel(t, tun)
+
+	if again := tun.channels[0].source(); again != source {
+		t.Errorf("expected the tunnel to listen on %s again, but it is listening on %s", source, again)
+	}
+}
+
+// The endpoint a reverse dynamic tunnel serves its proxy on is listened on by
+// the ssh server, so it dies with the connection to it: a new listener is
+// created on the same endpoint, and served, as soon as the tunnel connects to
+// the server again.
+func TestReverseDynamicTunnelListensAgainAfterReconnection(t *testing.T) {
+	tun, ssh, started := prepareDynamicTunnel(t, "reverse-dynamic", []string{"127.0.0.1:0"}, 3)
+	defer stopDynamicTunnel(t, tun, started)
+
+	waitForDynamicTunnel(t, tun)
+
+	endpoint, server := createHttpServer()
+	defer server.Close()
+
+	address := endpoint.Addr().String()
+	proxy := tun.channels[0].address()
+
+	if err := validateDynamicTunnelConnectivity("STU", address, tun); err != nil {
+		t.Fatalf("error while reaching the endpoint through the tunnel: %v", err)
+	}
+
+	ssh.Close()
+
+	ssh, err := createSSHServer(t, ssh.Addr().String(), keyPath)
+	if err != nil {
+		t.Fatalf("error while recreating the ssh server: %v", err)
+	}
+	defer ssh.Close()
+
+	waitForDynamicTunnel(t, tun)
+
+	// the endpoint is the one the clients of the proxy already know about, so
+	// the tunnel has to ask the ssh server for it again rather than for whatever
+	// it is given.
+	if again := tun.channels[0].address(); again != proxy {
+		t.Errorf("expected the tunnel to serve the proxy on %s again, but it is serving it on %s", proxy, again)
+	}
+
+	if err := validateDynamicTunnelConnectivity("VWX", address, tun); err != nil {
+		t.Errorf("error while reaching the endpoint after the tunnel reconnected: %v", err)
+	}
+}
+
+// Giving the endpoint back is how a channel listening on the ssh server stops
+// listening, so the server has to hear about it: a listener closed without the
+// server being told leaves the endpoint bound on the other side.
+func TestReverseDynamicChannelGivesTheEndpointBack(t *testing.T) {
+	tun, ssh, started := prepareDynamicTunnel(t, "reverse-dynamic", []string{"127.0.0.1:0"}, 3)
+	defer ssh.Close()
+	defer stopDynamicTunnel(t, tun, started)
+
+	waitForDynamicTunnel(t, tun)
+
+	endpoint := tun.channels[0].address()
+
+	if err := tun.channels[0].Close(); err != nil {
+		t.Fatalf("error while giving the endpoint back to the ssh server: %v", err)
+	}
+
+	if err := waitForClosedEndpoint(endpoint, 2*time.Second); err != nil {
+		t.Errorf("%v", err)
+	}
+}
+
+// The connections a reverse dynamic tunnel serves come from the ssh server and
+// live on the connection to it, while the addresses they ask for are reached
+// from here: losing that connection leaves the direction reading from the ssh
+// side at the end of its stream and the opposite one waiting on an endpoint
+// that has no reason to ever speak again, so both have to be released even
+// though the tunnel itself carries on and reconnects.
+func TestReverseDynamicTunnelReleasesConnectionsOnReconnection(t *testing.T) {
+	forwarded := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+
+	// an endpoint that says nothing leaves the connection idle both ways, which
+	// is what a client holding one open without using it looks like.
+	endpoint, err := createTCPServer(func(conn net.Conn) {
+		forwarded <- struct{}{}
+
+		<-release
+	})
+	if err != nil {
+		t.Fatalf("error while creating the endpoint: %v", err)
+	}
+	defer endpoint.Close()
+
+	tun, ssh, started := prepareDynamicTunnel(t, "reverse-dynamic", []string{"127.0.0.1:0"}, 3)
+	defer ssh.Close()
+	defer stopDynamicTunnel(t, tun, started)
+
+	waitForDynamicTunnel(t, tun)
+
+	conn, err := socksConnectTo(tun.channels[0].address(), endpoint.Addr().String())
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	defer conn.Close()
+
+	// the connection is only being forwarded, and so bound to both the endpoint
+	// and the connection to the ssh server it came from, once it reached the
+	// endpoint.
+	select {
+	case <-forwarded:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the connection never reached the endpoint through the tunnel")
+	}
+
+	// the connection to the ssh server is dropped rather than the server taken
+	// down, so that the tunnel reconnects to it right away instead of waiting
+	// out the retries: the tunnel carrying on is what tells this release apart
+	// from the one every connection gets when the tunnel stops.
+	tun.sshClient().Close()
+
+	waitForDynamicTunnel(t, tun)
+
+	// the tunnel is serving again on a new connection to the ssh server, which
+	// the connection made through the previous one can't be carried on.
+	if err := waitForGoroutines(serveSocksFrame, 0, 5*time.Second); err != nil {
+		t.Errorf("the tunnel kept serving a connection whose ssh channel is gone: %v", err)
 	}
 }
 
@@ -331,6 +568,7 @@ func TestSocksServerResolvesNamesRemotely(t *testing.T) {
 
 func TestBuildDynamicSSHChannels(t *testing.T) {
 	tests := []struct {
+		channelType   string
 		serverName    string
 		source        []string
 		destination   []string
@@ -339,43 +577,85 @@ func TestBuildDynamicSSHChannels(t *testing.T) {
 		expectedError string
 	}{
 		{
-			serverName: "test",
-			source:     []string{"127.0.0.1:1080"},
-			config:     "testdata/.ssh/config",
-			expected:   []string{"127.0.0.1:1080"},
+			channelType: "dynamic",
+			serverName:  "test",
+			source:      []string{"127.0.0.1:1080"},
+			config:      "testdata/.ssh/config",
+			expected:    []string{"127.0.0.1:1080"},
 		},
 		{
-			serverName: "test",
-			source:     []string{":1080", ":1081"},
-			config:     "testdata/.ssh/config",
-			expected:   []string{"127.0.0.1:1080", "127.0.0.1:1081"},
+			channelType: "dynamic",
+			serverName:  "test",
+			source:      []string{":1080", ":1081"},
+			config:      "testdata/.ssh/config",
+			expected:    []string{"127.0.0.1:1080", "127.0.0.1:1081"},
 		},
 		{
-			serverName: "hostWithDynamicForward",
-			config:     "testdata/.ssh/config",
-			expected:   []string{"127.0.0.1:1080"},
+			channelType: "dynamic",
+			serverName:  "hostWithDynamicForward",
+			config:      "testdata/.ssh/config",
+			expected:    []string{"127.0.0.1:1080"},
 		},
 		{
-			serverName: "hostWithTwoDynamicForwards",
-			config:     "testdata/.ssh/config",
-			expected:   []string{"127.0.0.1:1080", "192.168.1.1:1081"},
+			channelType: "dynamic",
+			serverName:  "hostWithTwoDynamicForwards",
+			config:      "testdata/.ssh/config",
+			expected:    []string{"127.0.0.1:1080", "192.168.1.1:1081"},
 		},
 		{
+			channelType:   "dynamic",
 			serverName:    "test",
 			source:        []string{"127.0.0.1:1080"},
 			destination:   []string{"172.17.0.1:8080"},
 			config:        "testdata/.ssh/config",
-			expectedError: DestinationNotAllowed,
+			expectedError: fmt.Sprintf(DestinationNotAllowed, "dynamic"),
 		},
 		{
+			channelType:   "dynamic",
 			serverName:    "test",
 			config:        "testdata/.ssh/config",
-			expectedError: "forward config could not be found or has invalid syntax for host test",
+			expectedError: "dynamic forward config could not be found or has invalid syntax for host test",
+		},
+		{
+			channelType: "reverse-dynamic",
+			serverName:  "test",
+			source:      []string{":1080"},
+			config:      "testdata/.ssh/config",
+			expected:    []string{"127.0.0.1:1080"},
+		},
+		// a RemoteForward carrying a source endpoint alone asks for a reverse
+		// dynamic forward, while the ones naming a destination are remote
+		// forwards and are left to a remote tunnel.
+		{
+			channelType: "reverse-dynamic",
+			serverName:  "hostWithReverseDynamicForward",
+			config:      "testdata/.ssh/config",
+			expected:    []string{"127.0.0.1:1080"},
+		},
+		{
+			channelType: "reverse-dynamic",
+			serverName:  "hostWithReverseDynamicAndRemoteForwards",
+			config:      "testdata/.ssh/config",
+			expected:    []string{"127.0.0.1:1080", "192.168.1.1:1081"},
+		},
+		{
+			channelType:   "reverse-dynamic",
+			serverName:    "test",
+			source:        []string{"127.0.0.1:1080"},
+			destination:   []string{"172.17.0.1:8080"},
+			config:        "testdata/.ssh/config",
+			expectedError: fmt.Sprintf(DestinationNotAllowed, "reverse-dynamic"),
+		},
+		{
+			channelType:   "reverse-dynamic",
+			serverName:    "hostWithRemoteForward",
+			config:        "testdata/.ssh/config",
+			expectedError: "reverse-dynamic forward config could not be found or has invalid syntax for host hostWithRemoteForward",
 		},
 	}
 
 	for id, test := range tests {
-		channels, err := buildSSHChannels(test.serverName, "dynamic", test.source, test.destination, test.config)
+		channels, err := buildSSHChannels(test.serverName, test.channelType, test.source, test.destination, test.config)
 
 		if test.expectedError != "" {
 			if err == nil {
@@ -403,11 +683,11 @@ func TestBuildDynamicSSHChannels(t *testing.T) {
 			}
 
 			if channel.Destination != "" {
-				t.Errorf("a dynamic channel should have no destination, but got %s for test %d", channel.Destination, id)
+				t.Errorf("a %s channel should have no destination, but got %s for test %d", test.channelType, channel.Destination, id)
 			}
 
-			if channel.ChannelType != "dynamic" {
-				t.Errorf("wrong channel type for test %d: expected: dynamic, value: %s", id, channel.ChannelType)
+			if channel.ChannelType != test.channelType {
+				t.Errorf("wrong channel type for test %d: expected: %s, value: %s", id, test.channelType, channel.ChannelType)
 			}
 		}
 	}
@@ -448,10 +728,66 @@ func TestDynamicForwardConfig(t *testing.T) {
 	}
 }
 
-// prepareDynamicTunnel creates a dynamic Tunnel object listening on the given
-// source endpoints, making sure the ssh server it depends on is ready, and
-// starts it.
-func prepareDynamicTunnel(t *testing.T, source []string, retries int) (tun *Tunnel, sshServer net.Listener, started <-chan error) {
+// A RemoteForward carrying a source endpoint alone asks for a reverse dynamic
+// forward, while the ones naming a destination are remote forwards: a host can
+// have both, and neither kind can be taken for the other.
+func TestReverseDynamicForwardConfig(t *testing.T) {
+	cfg, err := NewSSHConfigFile("testdata/.ssh/config")
+	if err != nil {
+		t.Fatalf("error while reading the ssh config file: %v", err)
+	}
+
+	tests := []struct {
+		host           string
+		expected       []string
+		expectedRemote []*ForwardConfig
+	}{
+		{host: "test"},
+		{
+			host:           "hostWithRemoteForward",
+			expectedRemote: []*ForwardConfig{{Source: "127.0.0.1:8080", Destination: "172.17.0.1:8080"}},
+		},
+		{
+			host:     "hostWithReverseDynamicForward",
+			expected: []string{"127.0.0.1:1080"},
+		},
+		{
+			host:           "hostWithReverseDynamicAndRemoteForwards",
+			expected:       []string{"127.0.0.1:1080", "192.168.1.1:1081"},
+			expectedRemote: []*ForwardConfig{{Source: "127.0.0.1:8080", Destination: "172.17.0.1:8080"}},
+		},
+	}
+
+	for _, test := range tests {
+		host := cfg.Get(test.host)
+
+		fwds := host.ReverseDynamicForwards
+
+		if len(fwds) != len(test.expected) {
+			t.Errorf("wrong number of reverse dynamic forwards for host %s: expected: %d, value: %d", test.host, len(test.expected), len(fwds))
+			continue
+		}
+
+		for i, fwd := range fwds {
+			if fwd.Source != test.expected[i] {
+				t.Errorf("wrong reverse dynamic forward source for host %s: expected: %s, value: %s", test.host, test.expected[i], fwd.Source)
+			}
+
+			if fwd.Destination != "" {
+				t.Errorf("a reverse dynamic forward should have no destination, but host %s got %s", test.host, fwd.Destination)
+			}
+		}
+
+		if !reflect.DeepEqual(host.RemoteForwards, test.expectedRemote) {
+			t.Errorf("wrong remote forwards for host %s: expected: %v, value: %v", test.host, test.expectedRemote, host.RemoteForwards)
+		}
+	}
+}
+
+// prepareDynamicTunnel creates a dynamic or a reverse dynamic Tunnel object
+// listening on the given source endpoints, making sure the ssh server it
+// depends on is ready, and starts it.
+func prepareDynamicTunnel(t *testing.T, tunnelType string, source []string, retries int) (tun *Tunnel, sshServer net.Listener, started <-chan error) {
 	sshServer, err := createSSHServer(t, "", keyPath)
 	if err != nil {
 		t.Fatalf("error while creating ssh server: %v", err)
@@ -464,7 +800,7 @@ func prepareDynamicTunnel(t *testing.T, source []string, retries int) (tun *Tunn
 
 	srv.Insecure = true
 
-	tun, err = New("dynamic", srv, source, nil, configPath)
+	tun, err = New(tunnelType, srv, source, nil, configPath)
 	if err != nil {
 		t.Fatalf("error while creating the tunnel: %v", err)
 	}

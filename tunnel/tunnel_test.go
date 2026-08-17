@@ -16,10 +16,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/phayes/freeport"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 	"golang.org/x/crypto/ssh"
@@ -27,6 +27,11 @@ import (
 )
 
 const NoSshRetries = -1
+
+// addressesReached counts the addresses the test ssh servers have been asked to
+// reach, which is what tells a connection made from the ssh server from one
+// made from the machine the tunnel runs on.
+var addressesReached atomic.Int64
 
 var sshDir string
 var keyPath string
@@ -1177,8 +1182,11 @@ func prepareTunnel(config *tunnelConfig) (tun *Tunnel, ssh net.Listener, started
 		} else if config.TunnelType == "remote" {
 			l, _ := createHttpServer()
 
-			source[i] = l.Addr().String()
-			destination[i] = "127.0.0.1:0"
+			// the source endpoint is listened on by the ssh server, which is
+			// asked for any free port, while the destination is reached from
+			// here.
+			source[i] = "127.0.0.1:0"
+			destination[i] = l.Addr().String()
 		} else {
 			config.T.Errorf("could not configure destination endpoints for testing: %v\n", err)
 			return
@@ -1323,8 +1331,11 @@ func createTCPServer(handler func(conn net.Conn)) (net.Listener, error) {
 // the given keyPath, listens on a random user port and returns the SSH Server
 // address.
 //
-// The SSH Server created by this function only responds to "direct-tcpip",
-// which is used to establish local port forwarding.
+// The SSH Server created by this function responds to "direct-tcpip", which is
+// used to establish local port forwarding, and to "tcpip-forward", which is
+// used to establish remote and reverse dynamic port forwarding: the endpoint
+// asked for is listened on and every connection made to it is handed back over
+// a "forwarded-tcpip" channel.
 //
 // References:
 // https://gist.github.com/jpillora/b480fde82bff51a06238
@@ -1374,39 +1385,86 @@ func createSSHServer(t *testing.T, address string, keyPath string) (net.Listener
 
 			conns = append(conns, serverConn)
 
-			// go routine to handle ssh client requests. In the context of mole's test,
-			// this is needed when a remote ssh forwarding listens to a port on the jump
-			// server and the port needs to be randomized (port is given as 0).
-			// The reply's needs to carry the port to be listened in its payload.
-			// All requests but "tcpip-forward" are discarded.
-			go func(reqs <-chan *ssh.Request) {
-				var err error
+			// gone is closed as soon as the connection just accepted is over,
+			// so that everything served on its behalf is released with it, the
+			// same way a real ssh server does.
+			gone := make(chan struct{})
+
+			go func(serverConn ssh.Conn) {
+				serverConn.Wait()
+
+				close(gone)
+			}(serverConn)
+
+			// go routine to handle ssh client requests. All requests but the
+			// ones asking for an endpoint to be listened on, and for one to be
+			// given up, are discarded: the endpoint a tunnel names is listened
+			// on here and the connections made to it are handed back to it over
+			// "forwarded-tcpip" channels.
+			go func(serverConn ssh.Conn, reqs <-chan *ssh.Request) {
+				// the endpoints a connection asked for are released along with
+				// it, unless they were given up before that.
+				listeners := map[string]net.Listener{}
+
+				defer func() {
+					for _, listener := range listeners {
+						listener.Close()
+					}
+				}()
 
 				for newReq := range reqs {
-					if newReq.Type != "tcpip-forward" {
-						err = newReq.Reply(false, nil)
+					switch newReq.Type {
+					case "tcpip-forward":
+						listener, host, port, err := listenForward(newReq.Payload)
 						if err != nil {
-							t.Errorf("error replying to tcpip-forward request: %v", err)
+							newReq.Reply(false, nil) //nolint: errcheck
+							continue
 						}
-						return
-					}
 
-					if newReq.WantReply {
-						ports, err := freeport.GetFreePorts(1)
-						if err != nil {
-							t.Errorf("could not get a free port: %v", err)
-							return
+						// the endpoint is kept under the address the client
+						// knows it by, which is the host it asked for carrying
+						// the port it was given, since that is what it names
+						// when it gives the endpoint up.
+						address := net.JoinHostPort(host, strconv.FormatUint(uint64(port), 10))
+
+						listeners[address] = listener
+
+						// the reply carries the port that was bound, which is
+						// how a client that asked for any port hears about the
+						// one it got.
+						payload := make([]byte, 4)
+						binary.BigEndian.PutUint32(payload, port)
+
+						if err := newReq.Reply(true, payload); err != nil {
+							listener.Close()
+							delete(listeners, address)
+
+							continue
 						}
-						port := make([]byte, 4)
-						binary.BigEndian.PutUint32(port, uint32(ports[0]))
-						err = newReq.Reply(true, port)
+
+						go forwardConnections(serverConn, listener, host, port, gone)
+					case "cancel-tcpip-forward":
+						address, err := forwardAddress(newReq.Payload)
 						if err != nil {
-							t.Errorf("error replying to tcpip-forward request: %v", err)
-							return
+							newReq.Reply(false, nil) //nolint: errcheck
+							continue
 						}
+
+						listener, listening := listeners[address]
+						if !listening {
+							newReq.Reply(false, nil) //nolint: errcheck
+							continue
+						}
+
+						listener.Close()
+						delete(listeners, address)
+
+						newReq.Reply(true, nil) //nolint: errcheck
+					default:
+						newReq.Reply(false, nil) //nolint: errcheck
 					}
 				}
-			}(reqs)
+			}(serverConn, reqs)
 
 			// go routine to handle requests to create new ssh channels. This particular
 			// implementation only supports "direct-tcpip", which is the identifier used
@@ -1415,6 +1473,14 @@ func createSSHServer(t *testing.T, address string, keyPath string) (net.Listener
 				for newChan := range chans {
 					go func(newChan ssh.NewChannel) {
 						var err error
+
+						// a channel asking for an address is what reaching one
+						// through the ssh server looks like, so counting them is
+						// how a test tells that side apart from the one the
+						// tunnel runs on.
+						if newChan.ChannelType() == "direct-tcpip" {
+							addressesReached.Add(1)
+						}
 
 						if ct := newChan.ChannelType(); ct != "direct-tcpip" {
 							err = newChan.Reject(ssh.UnknownChannelType, fmt.Sprintf("unknown channel type: %s", ct))
@@ -1471,6 +1537,135 @@ func createSSHServer(t *testing.T, address string, keyPath string) (net.Listener
 	}(l)
 
 	return l, nil
+}
+
+// forwardRequest is what a "tcpip-forward" request, and the one giving the
+// endpoint it created back, carry: the endpoint to listen on.
+type forwardRequest struct {
+	Host string
+	Port uint32
+}
+
+// forwardAddress returns the endpoint named by a "cancel-tcpip-forward"
+// request, which is the address the client knows it by.
+func forwardAddress(payload []byte) (string, error) {
+	var request forwardRequest
+
+	if err := ssh.Unmarshal(payload, &request); err != nil {
+		return "", err
+	}
+
+	return net.JoinHostPort(request.Host, strconv.FormatUint(uint64(request.Port), 10)), nil
+}
+
+// listenForward creates the listener asked for by a "tcpip-forward" request,
+// returning it along with the host and the port it was bound on.
+//
+// The host is the one carried by the request, rather than the address the
+// listener ended up bound to, since that is what the client matches the
+// connections handed back to it against.
+func listenForward(payload []byte) (net.Listener, string, uint32, error) {
+	var request forwardRequest
+
+	if err := ssh.Unmarshal(payload, &request); err != nil {
+		return nil, "", 0, err
+	}
+
+	address := net.JoinHostPort(request.Host, strconv.FormatUint(uint64(request.Port), 10))
+
+	var listener net.Listener
+	var err error
+
+	// a tunnel that reconnects asks for the very same endpoint again, which the
+	// connection that is gone may not have released yet, so the address is
+	// waited for rather than refused right away.
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		listener, err = net.Listen("tcp", address)
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	return listener, request.Host, uint32(listener.Addr().(*net.TCPAddr).Port), nil
+}
+
+// forwardConnections hands every connection made to the given listener over to
+// the given ssh connection as a "forwarded-tcpip" channel, which is how a ssh
+// server serves the endpoints it was asked to listen on, until the listener is
+// closed.
+//
+// The host and the port must be the ones asked for by the request the listener
+// was created from: a channel carrying anything else is refused by the client.
+//
+// gone tells when the ssh connection is over, which releases the connections
+// still being carried: one whose client is done sending waits for the peer it
+// is half closed towards, and that peer is on the other side of a connection
+// that is not coming back.
+func forwardConnections(serverConn ssh.Conn, listener net.Listener, host string, port uint32, gone <-chan struct{}) {
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+
+		go func(conn net.Conn) {
+			defer conn.Close()
+
+			origin, ok := conn.RemoteAddr().(*net.TCPAddr)
+			if !ok {
+				return
+			}
+
+			payload := ssh.Marshal(struct {
+				Host       string
+				Port       uint32
+				OriginHost string
+				OriginPort uint32
+			}{host, port, origin.IP.String(), uint32(origin.Port)})
+
+			channel, reqs, err := serverConn.OpenChannel("forwarded-tcpip", payload)
+			if err != nil {
+				return
+			}
+			defer channel.Close()
+
+			go ssh.DiscardRequests(reqs)
+
+			// the end of the stream is told to the other end of the connection,
+			// as a real ssh server does, so that a client whose endpoint is
+			// done, or an endpoint whose client is done, hears about it instead
+			// of waiting for data that is never coming.
+			done := make(chan struct{})
+
+			go func() {
+				io.Copy(channel, conn)
+
+				channel.CloseWrite()
+
+				close(done)
+			}()
+
+			io.Copy(conn, channel)
+
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				tcp.CloseWrite()
+			}
+
+			// the opposite direction is left to finish on its own, unless the
+			// connection carrying the channel it writes to is gone, in which
+			// case it is waiting on a client that has nothing to reach anymore.
+			select {
+			case <-done:
+			case <-gone:
+			}
+		}(conn)
+	}
 }
 
 // generateKnownHosts creates a new "known_hosts" file on a given path with a

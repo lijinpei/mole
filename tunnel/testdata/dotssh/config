@@ -39,3 +39,26 @@ Host hostWithTwoDynamicForwards
     DynamicForward 192.168.1.1:1081
     User mole_test
     IdentityFile ~/.ssh/id_rsa
+
+Host hostWithRemoteForward
+    Hostname 127.0.0.1
+    Port 2222
+    RemoteForward 8080 172.17.0.1:8080
+    User mole_test
+    IdentityFile ~/.ssh/id_rsa
+
+Host hostWithReverseDynamicForward
+    Hostname 127.0.0.1
+    Port 2222
+    RemoteForward 1080
+    User mole_test
+    IdentityFile ~/.ssh/id_rsa
+
+Host hostWithReverseDynamicAndRemoteForwards
+    Hostname 127.0.0.1
+    Port 2222
+    RemoteForward 1080
+    RemoteForward 8080 172.17.0.1:8080
+    RemoteForward 192.168.1.1:1081
+    User mole_test
+    IdentityFile ~/.ssh/id_rsa
