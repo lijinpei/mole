@@ -8,12 +8,17 @@ import (
 	socks5 "github.com/things-go/go-socks5"
 )
 
-// newSocksServer creates the socks server used to serve the channels of a
-// dynamic tunnel, reaching the addresses asked for by its clients through the
-// given dial function.
+// newSocksServer creates a socks server to serve a single connection made to a
+// channel of a dynamic tunnel, reaching the address asked for by its client
+// through the given dial function.
 //
-// The server is only given the connections already accepted by the tunnel, so
-// it never listens on anything itself.
+// A server is made for every connection rather than shared by all of them so
+// that the dial function can be the one of the connection being served, which
+// is how the connection to the ssh server the address was reached through is
+// known to whoever is serving it.
+//
+// The server is only given the connection already accepted by the tunnel, so it
+// never listens on anything itself.
 func newSocksServer(dial func(ctx context.Context, network, address string) (net.Conn, error)) *socks5.Server {
 	return socks5.NewServer(
 		socks5.WithDial(dial),
@@ -26,19 +31,38 @@ func newSocksServer(dial func(ctx context.Context, network, address string) (net
 	)
 }
 
-// dialFromServer connects to the given address from the ssh server the tunnel
-// is currently connected to.
+// socksDial returns the function a socks server reaches the address asked for
+// by its client with, which is done from the ssh server the tunnel is connected
+// to.
 //
 // The connection to the ssh server is looked up on every call rather than kept,
 // so that the connections established after the tunnel reconnects are made on
-// the connection currently in use instead of the one that is already gone.
-func (t *Tunnel) dialFromServer(ctx context.Context, network, address string) (net.Conn, error) {
-	client := t.sshClient()
-	if client == nil {
-		return nil, fmt.Errorf("missing connection to the ssh server")
-	}
+// the connection currently in use instead of the one that is already gone. The
+// one the address ends up being reached through is reported on dialed, so that
+// whoever is serving the client can bind it to that connection and let go of
+// both together.
+func (t *Tunnel) socksDial(dialed chan<- <-chan struct{}) func(ctx context.Context, network, address string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		client, disconnected := t.sshConnection()
+		if client == nil {
+			return nil, fmt.Errorf("missing connection to the ssh server")
+		}
 
-	return client.DialContext(ctx, network, address)
+		target, err := client.DialContext(ctx, network, address)
+		if err != nil {
+			return nil, err
+		}
+
+		// the report is best effort: a socks server serves a single request,
+		// and whoever asked for the address is gone by the time it is done
+		// being served.
+		select {
+		case dialed <- disconnected:
+		default:
+		}
+
+		return target, nil
+	}
 }
 
 // remoteResolver leaves the resolution of the addresses asked for by the socks

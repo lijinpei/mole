@@ -915,9 +915,10 @@ func TestTunnelNeverGivesUpReconnecting(t *testing.T) {
 }
 
 const (
-	acceptFrame    = "tunnel.(*Tunnel).acceptConnections("
-	keepAliveFrame = "tunnel.(*Tunnel).keepAlive("
-	forwardFrame   = "tunnel.(*Tunnel).forward("
+	acceptFrame     = "tunnel.(*Tunnel).acceptConnections("
+	keepAliveFrame  = "tunnel.(*Tunnel).keepAlive("
+	forwardFrame    = "tunnel.(*Tunnel).forward("
+	serveSocksFrame = "tunnel.(*Tunnel).serveSocks("
 )
 
 // countGoroutines returns the number of goroutines currently running the

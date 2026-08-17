@@ -178,6 +178,64 @@ func TestDynamicTunnelReleasesIdleConnectionsOnStop(t *testing.T) {
 	}
 }
 
+// The connections the socks server is forwarding are dialed from the connection
+// to the ssh server the tunnel is using at the time: losing it leaves the
+// direction bringing the answer back at the end of its stream and the opposite
+// one waiting on a client that has no reason to ever speak again, so they have
+// to be released even though the tunnel itself carries on and reconnects.
+func TestDynamicTunnelReleasesConnectionsOnReconnection(t *testing.T) {
+	forwarded := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+
+	// an endpoint that says nothing leaves the connection idle both ways, which
+	// is what a client holding one open without using it looks like.
+	endpoint, err := createTCPServer(func(conn net.Conn) {
+		forwarded <- struct{}{}
+
+		<-release
+	})
+	if err != nil {
+		t.Fatalf("error while creating the endpoint: %v", err)
+	}
+	defer endpoint.Close()
+
+	tun, ssh, started := prepareDynamicTunnel(t, []string{"127.0.0.1:0"}, 3)
+	defer ssh.Close()
+	defer stopDynamicTunnel(t, tun, started)
+
+	waitForDynamicTunnel(t, tun)
+
+	conn, err := socksConnectTo(tun.channels[0].address(), endpoint.Addr().String())
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	defer conn.Close()
+
+	// the connection is only being forwarded, and so bound to the connection to
+	// the ssh server it was dialed from, once it reached the endpoint.
+	select {
+	case <-forwarded:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the connection never reached the endpoint through the tunnel")
+	}
+
+	// the connection to the ssh server is dropped rather than the server taken
+	// down, so that the tunnel reconnects to it right away instead of waiting
+	// out the retries: what the connection being served depends on is the one
+	// it was dialed from, and the tunnel carrying on is what tells its release
+	// apart from the one every connection gets when the tunnel stops.
+	tun.sshClient().Close()
+
+	waitForDynamicTunnel(t, tun)
+
+	// the tunnel is serving again on a new connection to the ssh server, which
+	// the connection made through the previous one can't be carried on.
+	if err := waitForGoroutines(serveSocksFrame, 0, 5*time.Second); err != nil {
+		t.Errorf("the tunnel kept serving a connection whose ssh channel is gone: %v", err)
+	}
+}
+
 func TestDynamicTunnelRepliesWhileThereIsNoSSHConnection(t *testing.T) {
 	tun, ssh, started := prepareDynamicTunnel(t, []string{"127.0.0.1:0"}, 3)
 	defer ssh.Close()

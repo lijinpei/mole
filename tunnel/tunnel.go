@@ -14,7 +14,6 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 
 	log "github.com/sirupsen/logrus"
-	socks5 "github.com/things-go/go-socks5"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
@@ -292,9 +291,6 @@ type Tunnel struct {
 	// goroutines that any error they get from that point on is expected.
 	stop     chan struct{}
 	stopOnce sync.Once
-	// socks serves the connections made to the channels of a dynamic tunnel and
-	// is nil on every other kind of tunnel.
-	socks *socks5.Server
 }
 
 // New creates a new instance of Tunnel.
@@ -323,10 +319,6 @@ func New(tunnelType string, server *Server, source, destination []string, config
 		reconnect: make(chan error, 1),
 		done:      make(chan error, 1),
 		stop:      make(chan struct{}),
-	}
-
-	if tunnelType == "dynamic" {
-		t.socks = newSocksServer(t.dialFromServer)
 	}
 
 	return t, nil
@@ -590,27 +582,65 @@ func (t *Tunnel) forward(channel *SSHChannel, conn, destinationConn net.Conn, di
 //
 // The connection belongs to the socks server from this point on: it is closed
 // as soon as the client is done with it, whether the forwarding succeeded or
-// not, or as soon as the tunnel stops, whichever comes first.
+// not, as soon as the connection to the ssh server carrying it is gone, or as
+// soon as the tunnel stops, whichever comes first.
 func (t *Tunnel) serveSocks(channel *SSHChannel, conn net.Conn) {
-	// a connection the socks server is still reading a request from is not
-	// bound to anything the tunnel closes on its way out, unlike the ones
-	// already being forwarded, which die with the connection to the ssh server
-	// carrying them. Releasing it here keeps a client that connects and says
-	// nothing from holding a socket, and the goroutine serving it, for as long
-	// as the process lives.
 	served := make(chan struct{})
 	defer close(served)
 
+	// dialed carries the signal telling when the connection to the ssh server
+	// the address asked for was reached through is gone, which only exists once
+	// the socks server has asked for one.
+	dialed := make(chan (<-chan struct{}), 1)
+
+	// a connection the socks server is still reading a request from is bound to
+	// nothing yet, so it is only released when the tunnel stops, which keeps a
+	// client that connects and says nothing from holding a socket, and the
+	// goroutine serving it, for as long as the process lives. A client that has
+	// not asked for anything is left alone while the tunnel reconnects, so that
+	// it is still told the address could not be reached rather than having its
+	// connection dropped in the middle of the protocol.
+	//
+	// One already being forwarded is released as soon as the connection to the
+	// ssh server carrying it is gone as well, since it can't be carried any
+	// further: the direction bringing the answer back sees the end of its
+	// stream, while the one reading from the client would be left waiting on a
+	// peer that has no reason to ever speak again.
 	go func() {
+		var disconnected <-chan struct{}
+
 		select {
+		case disconnected = <-dialed:
 		case <-t.stop:
 			conn.Close()
+			return
 		case <-served:
+			return
 		}
+
+		select {
+		case <-disconnected:
+		case <-t.stop:
+		case <-served:
+			return
+		}
+
+		conn.Close()
 	}()
 
-	err := t.socks.ServeConn(conn)
+	// the socks server is made for this connection alone, so that the address
+	// it is asked for is reached through a connection to the ssh server this
+	// one can be bound to.
+	err := newSocksServer(t.socksDial(dialed)).ServeConn(conn)
 	if err == nil {
+		return
+	}
+
+	// a connection released along with the tunnel, or along with the connection
+	// to the ssh server carrying it, fails whatever the socks server was in the
+	// middle of, which is this very code letting go of it rather than anything
+	// worth reporting.
+	if t.stopping() || errors.Is(err, net.ErrClosed) {
 		return
 	}
 
