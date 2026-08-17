@@ -27,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Close the SSH config file after reading it [#198]
 - Bump `tzinfo`, `activesupport` and `nokogiri` used to build the documentation
   site [#190] [#194] [#196]
+- A stale pid file no longer blocks `start` for good. The check for another
+  instance using the same id treated any pid that still resolved as a running
+  instance: on windows a process object, and with it the pid, outlives the
+  process for as long as anything still holds a handle to it, and on linux a
+  process that has exited but has not been reaped by its parent keeps its entry
+  in the process table
 
 ### Changed
 - Bump all dependencies to their latest versions, which raises the minimum Go version to 1.25
