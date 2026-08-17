@@ -1,0 +1,6 @@
+# Keep the working tree on LF everywhere. Git for Windows installs with
+# core.autocrlf=true by default and the CI runner image does not override it, so
+# without this a windows checkout gets CRLF: gofmt then reports every file as
+# unformatted, and the tests that compare command output against a fixture read
+# from disk stop matching.
+* text=auto eol=lf

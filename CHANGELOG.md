@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the process table
 
 ### Changed
+- CI runs the build and the test suite on windows as well as linux
 - Bump all dependencies to their latest versions, which raises the minimum Go version to 1.25
 - Replace the archived `github.com/mitchellh/mapstructure` with the maintained `github.com/go-viper/mapstructure/v2`
 - Replace the archived `github.com/mitchellh/go-ps` with the standard library
