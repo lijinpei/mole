@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process for as long as anything still holds a handle to it, and on linux a
   process that has exited but has not been reaped by its parent keeps its entry
   in the process table
+- A connection forwarded by a local or remote tunnel is no longer torn down as
+  soon as one of its two directions is done. A client that stopped sending, by
+  half closing its side of the connection, had the answer still on its way cut
+  short, and every connection that ended logged, at error level, the failure the
+  direction that lost the race got from the socket the other one had just closed.
+  Each direction now tells the end it writes to that nothing else is coming,
+  leaving the opposite one free to carry on, and both ends are released together
+  once the two directions are done, the connection to the ssh server carrying
+  them is gone, or the tunnel stops
 
 ### Changed
 - CI runs the build and the test suite on windows as well as linux

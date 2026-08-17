@@ -281,10 +281,13 @@ type Tunnel struct {
 	done     chan error
 	// client is replaced on every reconnection while the goroutines serving
 	// the channels keep running, so it must only be reached through
-	// sshClient and setSSHClient.
-	client      *ssh.Client
-	clientMutex sync.RWMutex
-	reconnect   chan error
+	// sshConnection and setSSHClient.
+	client *ssh.Client
+	// disconnected is closed as soon as the connection to the ssh server held
+	// in client is gone, and is replaced along with it.
+	disconnected <-chan struct{}
+	clientMutex  sync.RWMutex
+	reconnect    chan error
 	// stop is closed when the tunnel is shutting down, telling the channel
 	// goroutines that any error they get from that point on is expected.
 	stop     chan struct{}
@@ -332,18 +335,30 @@ func New(tunnelType string, server *Server, source, destination []string, config
 // sshClient returns the connection to the ssh server currently in use, which
 // is nil while the tunnel has none.
 func (t *Tunnel) sshClient() *ssh.Client {
+	client, _ := t.sshConnection()
+
+	return client
+}
+
+// sshConnection returns the connection to the ssh server currently in use
+// along with the channel that is closed as soon as that very connection is
+// gone, which is how everything bound to it hears it has to stop. Both are nil
+// while the tunnel has no connection.
+func (t *Tunnel) sshConnection() (*ssh.Client, <-chan struct{}) {
 	t.clientMutex.RLock()
 	defer t.clientMutex.RUnlock()
 
-	return t.client
+	return t.client, t.disconnected
 }
 
-// setSSHClient sets the connection to the ssh server to be used from now on.
-func (t *Tunnel) setSSHClient(client *ssh.Client) {
+// setSSHClient sets the connection to the ssh server to be used from now on,
+// together with the channel telling when that connection is gone.
+func (t *Tunnel) setSSHClient(client *ssh.Client, disconnected <-chan struct{}) {
 	t.clientMutex.Lock()
 	defer t.clientMutex.Unlock()
 
 	t.client = client
+	t.disconnected = disconnected
 }
 
 // Start creates the ssh tunnel and initialized all channels allowing data
@@ -496,7 +511,7 @@ func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn) error {
 		return nil
 	}
 
-	client := t.sshClient()
+	client, disconnected := t.sshConnection()
 	if client == nil {
 		return fmt.Errorf("tunnel channel can't be established: missing connection to the ssh server")
 	}
@@ -515,8 +530,7 @@ func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn) error {
 		return fmt.Errorf("dial error: %s", err)
 	}
 
-	go copyConn(conn, destinationConn)
-	go copyConn(destinationConn, conn)
+	go t.forward(channel, conn, destinationConn, disconnected)
 
 	log.WithFields(log.Fields{
 		"channel": channel,
@@ -524,6 +538,50 @@ func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn) error {
 	}).Debug("tunnel channel has been established")
 
 	return nil
+}
+
+// forward carries data both ways between the given connections, which must
+// have been established on the connection to the ssh server the given channel
+// tells about, until both directions are done, that connection is gone or the
+// tunnel stops, whichever comes first, and closes both of them on its way out.
+func (t *Tunnel) forward(channel *SSHChannel, conn, destinationConn net.Conn, disconnected <-chan struct{}) {
+	// one of the two connections lives on the connection to the ssh server and
+	// dies with it, which the direction reading from it sees as the end of the
+	// stream, while the direction reading from the other one is left waiting on
+	// a peer that has no reason to ever speak again. Releasing both ends as
+	// soon as the ssh connection is gone, or the tunnel stops, is what keeps
+	// that direction from outliving what it was forwarding.
+	done := make(chan struct{})
+
+	go func() {
+		select {
+		case <-t.stop:
+		case <-disconnected:
+		case <-done:
+			return
+		}
+
+		conn.Close()
+		destinationConn.Close()
+	}()
+
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+
+	// conn is the connection the client made, whether it reached the source
+	// endpoint of a local channel or the one a remote channel asked the ssh
+	// server to listen on, so it is the one that can tell who is being served.
+	client := conn.RemoteAddr()
+
+	go func() { defer wg.Done(); t.copyConn(channel, client, conn, destinationConn) }()
+	go func() { defer wg.Done(); t.copyConn(channel, client, destinationConn, conn) }()
+
+	wg.Wait()
+	close(done)
+
+	conn.Close()
+	destinationConn.Close()
 }
 
 // serveSocks hands the given connection over to the socks server, which reads
@@ -578,7 +636,7 @@ func (t *Tunnel) String() string {
 func (t *Tunnel) dial() error {
 	if client := t.sshClient(); client != nil {
 		client.Close()
-		t.setSSHClient(nil)
+		t.setSSHClient(nil, nil)
 	}
 
 	c, err := sshClientConfig(*t.server)
@@ -619,12 +677,14 @@ func (t *Tunnel) dial() error {
 		break
 	}
 
-	t.setSSHClient(client)
-
 	// disconnected is closed as soon as the connection just established is
 	// gone, so that everything bound to it stops with it rather than through a
-	// signal a later connection could end up consuming.
+	// signal a later connection could end up consuming. It is handed over along
+	// with the connection so that whoever picks one up gets the signal that
+	// belongs to it.
 	disconnected := make(chan struct{})
+
+	t.setSSHClient(client, disconnected)
 
 	// both goroutines below are bound to the connection just established, so
 	// they are given it instead of reaching for whatever connection the tunnel
@@ -827,13 +887,37 @@ func sshClientConfig(server Server) (*ssh.ClientConfig, error) {
 	}, nil
 }
 
-func copyConn(writer, reader net.Conn) {
+// copyConn forwards data in a single direction, on behalf of the given client,
+// signalling the end of the stream to the writer once the reader is done while
+// leaving the opposite direction free to carry on. Closing both ends is up to
+// forward.
+func (t *Tunnel) copyConn(channel *SSHChannel, client net.Addr, writer, reader net.Conn) {
 	_, err := io.Copy(writer, reader)
-	defer writer.Close()
-	defer reader.Close()
-	if err != nil {
-		log.Errorf("%v", err)
+
+	// a half close tells the peer there is nothing else coming without
+	// tearing down the connection, which the opposite direction may still
+	// be using.
+	if cw, ok := writer.(interface{ CloseWrite() error }); ok {
+		cw.CloseWrite() //nolint: errcheck
+	} else {
+		writer.Close() //nolint: errcheck
 	}
+
+	// a connection dying while the tunnel is shutting down is expected, and so
+	// is the error a direction still reading gets once both ends are released,
+	// which is what happens to every connection in flight when the tunnel
+	// stops or loses the connection to the ssh server: the plain socket
+	// reports that it has been closed, while a ssh channel reports the end of
+	// the stream, only ever as the answer to a write since io.Copy takes it
+	// for success on a read.
+	if err == nil || t.stopping() || errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) {
+		return
+	}
+
+	log.WithError(err).WithFields(log.Fields{
+		"channel": channel,
+		"client":  client,
+	}).Debug("error while forwarding connection")
 }
 
 func getAgentSigners(addr string) ([]ssh.Signer, error) {

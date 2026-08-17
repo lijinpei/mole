@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,10 +15,13 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/phayes/freeport"
+	log "github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
@@ -124,7 +128,7 @@ func TestServerOptions(t *testing.T) {
 }
 
 func TestLocalTunnel(t *testing.T) {
-	c := &tunnelConfig{t, "local", 1, false, NoSshRetries}
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 1, Insecure: false, ConnectionRetries: NoSshRetries}
 	tun, _, _ := prepareTunnel(c)
 
 	select {
@@ -143,8 +147,307 @@ func TestLocalTunnel(t *testing.T) {
 	tun.Stop()
 }
 
+// A client that is done sending is not done receiving: half closing its side
+// of the connection says nothing about the direction carrying the answer, which
+// has to be left alone until the endpoint is done with it.
+func TestLocalTunnelDoesNotTruncateAfterClientHalfClose(t *testing.T) {
+	head := []byte("the first half of the answer|")
+	tail := []byte("the second half, written after the client was done sending")
+
+	// the answer is only finished once the client has nothing else to send,
+	// which is the whole point: an endpoint that reads a request until the end
+	// of the stream can only answer it after that.
+	endpoint, err := createTCPServer(func(conn net.Conn) {
+		conn.Write(head)
+
+		io.Copy(io.Discard, conn)
+
+		conn.Write(tail)
+	})
+	if err != nil {
+		t.Fatalf("error while creating the endpoint: %v", err)
+	}
+	defer endpoint.Close()
+
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 1, Destination: endpoint.Addr().String(), Insecure: false, ConnectionRetries: NoSshRetries}
+	tun, _, _ := prepareTunnel(c)
+	defer tun.Stop()
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(1 * time.Second):
+		t.Fatalf("error waiting for tunnel to be ready")
+	}
+
+	conn, err := net.Dial("tcp", tun.channels[0].address())
+	if err != nil {
+		t.Fatalf("error while connecting to the tunnel: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("error while setting a deadline on the connection to the tunnel: %v", err)
+	}
+
+	if _, err := conn.Write([]byte("request")); err != nil {
+		t.Fatalf("error while sending a request through the tunnel: %v", err)
+	}
+
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatalf("error while half closing the connection to the tunnel: %v", err)
+	}
+
+	expected := append(append([]byte{}, head...), tail...)
+	answer := make([]byte, len(expected))
+
+	if _, err := io.ReadFull(conn, answer); err != nil {
+		t.Fatalf("the answer was cut short after the client was done sending: %v", err)
+	}
+
+	if !bytes.Equal(answer, expected) {
+		t.Errorf("expected the answer %q, but got %q", expected, answer)
+	}
+}
+
+// Half closing a connection leaves the socket alive, so the tunnel has to
+// release every connection it is forwarding when it stops or the ones whose
+// peer never speaks again would be left behind.
+func TestLocalTunnelReleasesConnectionsOnStop(t *testing.T) {
+	forwarded := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+
+	// an endpoint that says nothing leaves the direction carrying the answer
+	// waiting on it, just like the direction carrying the request waits on a
+	// client that has nothing else to send.
+	endpoint, err := createTCPServer(func(conn net.Conn) {
+		forwarded <- struct{}{}
+
+		<-release
+	})
+	if err != nil {
+		t.Fatalf("error while creating the endpoint: %v", err)
+	}
+	defer endpoint.Close()
+
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 1, Destination: endpoint.Addr().String(), Insecure: false, ConnectionRetries: NoSshRetries}
+	tun, _, started := prepareTunnel(c)
+
+	// giving up before the tunnel is stopped would leave it running for the
+	// rest of the package, and every test counting goroutines after this one
+	// would count the ones it owns.
+	stop := sync.OnceFunc(tun.Stop)
+	defer stop()
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(1 * time.Second):
+		t.Fatalf("error waiting for tunnel to be ready")
+	}
+
+	conn, err := net.Dial("tcp", tun.channels[0].address())
+	if err != nil {
+		t.Fatalf("error while connecting to the tunnel: %v", err)
+	}
+	defer conn.Close()
+
+	// the connection is only being forwarded, and so owned by the tunnel, once
+	// it reached the endpoint.
+	select {
+	case <-forwarded:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the connection never reached the endpoint through the tunnel")
+	}
+
+	stop()
+
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the tunnel never stopped")
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("error while setting a deadline on the connection to the tunnel: %v", err)
+	}
+
+	// nothing is ever sent to a client whose endpoint said nothing, so a read
+	// can only end by the tunnel letting go of the connection. It ends the same
+	// way whether it was closed or only half closed, though, so this catches a
+	// connection left untouched while the goroutine count below is what tells a
+	// released connection from a half closed one.
+	if _, err := conn.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Errorf("expected the connection to be released when the tunnel stopped, but reading from it returned %v", err)
+	}
+
+	// a connection nobody is forwarding anymore must not leave the goroutines
+	// that were carrying it behind either.
+	if err := waitForGoroutines(forwardFrame, 0, 5*time.Second); err != nil {
+		t.Errorf("the tunnel left connections behind when it stopped: %v", err)
+	}
+}
+
+// The connections a tunnel is forwarding live on its connection to the ssh
+// server: losing it leaves the direction reading from the ssh side at the end
+// of its stream and the opposite one waiting on a client that has no reason to
+// ever speak again, so both ends have to be released even though the tunnel
+// itself carries on and reconnects.
+func TestLocalTunnelReleasesConnectionsOnReconnection(t *testing.T) {
+	forwarded := make(chan struct{}, 1)
+	release := make(chan struct{})
+	defer close(release)
+
+	endpoint, err := createTCPServer(func(conn net.Conn) {
+		forwarded <- struct{}{}
+
+		<-release
+	})
+	if err != nil {
+		t.Fatalf("error while creating the endpoint: %v", err)
+	}
+	defer endpoint.Close()
+
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 1, Destination: endpoint.Addr().String(), Insecure: false, ConnectionRetries: 3}
+	tun, ssh, _ := prepareTunnel(c)
+	defer tun.Stop()
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(1 * time.Second):
+		t.Fatalf("error waiting for tunnel to be ready")
+	}
+
+	conn, err := net.Dial("tcp", tun.channels[0].address())
+	if err != nil {
+		t.Fatalf("error while connecting to the tunnel: %v", err)
+	}
+	defer conn.Close()
+
+	select {
+	case <-forwarded:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the connection never reached the endpoint through the tunnel")
+	}
+
+	ssh.Close()
+
+	if _, err := createSSHServer(t, ssh.Addr().String(), keyPath); err != nil {
+		t.Fatalf("error while recreating ssh server: %v", err)
+	}
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(10 * time.Second): // this is the maximum timeout based on the retries attempts
+		t.Fatalf("error waiting for the tunnel to reconnect to the ssh server")
+	}
+
+	// the tunnel is serving again on a new connection to the ssh server, which
+	// the connection made through the previous one can't be carried on.
+	if err := waitForGoroutines(forwardFrame, 0, 5*time.Second); err != nil {
+		t.Errorf("the tunnel kept forwarding a connection whose ssh channel is gone: %v", err)
+	}
+}
+
+// The end of a connection is not an error: whichever direction finishes first
+// tells the other end there is nothing else coming, which is the whole of it,
+// and the opposite direction is left to finish on its own.
+func TestLocalTunnelTeardownIsQuiet(t *testing.T) {
+	request := []byte("request")
+	answer := []byte("the whole answer")
+
+	endpoint, err := createTCPServer(func(conn net.Conn) {
+		// the request is taken before answering so that the connection is not
+		// closed with data still waiting to be read on it, which sends a reset
+		// that could take the answer with it.
+		io.ReadFull(conn, make([]byte, len(request)))
+
+		conn.Write(answer)
+	})
+	if err != nil {
+		t.Fatalf("error while creating the endpoint: %v", err)
+	}
+	defer endpoint.Close()
+
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 1, Destination: endpoint.Addr().String(), Insecure: false, ConnectionRetries: NoSshRetries}
+	tun, _, _ := prepareTunnel(c)
+	defer tun.Stop()
+
+	select {
+	case <-tun.Ready:
+		t.Log("tunnel is ready to accept connections")
+	case <-time.After(1 * time.Second):
+		t.Fatalf("error waiting for tunnel to be ready")
+	}
+
+	// the hook records everything logged from this point on, on the logger the
+	// whole package shares, so it is installed as late as possible, read as
+	// soon as the connection it is watching is gone, and taken back out rather
+	// than left recording every test that runs after this one.
+	logger := log.StandardLogger()
+	hooks := logger.ReplaceHooks(make(log.LevelHooks))
+	defer logger.ReplaceHooks(hooks)
+
+	hook := logtest.NewGlobal()
+
+	conn, err := net.Dial("tcp", tun.channels[0].address())
+	if err != nil {
+		t.Fatalf("error while connecting to the tunnel: %v", err)
+	}
+	defer conn.Close()
+
+	client := conn.LocalAddr().String()
+
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("error while setting a deadline on the connection to the tunnel: %v", err)
+	}
+
+	if _, err := conn.Write(request); err != nil {
+		t.Fatalf("error while sending a request through the tunnel: %v", err)
+	}
+
+	// the endpoint is done as soon as it answered, which is what tears the
+	// connection down, so reading it all is also waiting for the teardown to
+	// reach the client.
+	received, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("error while reading the answer through the tunnel: %v", err)
+	}
+
+	if !bytes.Equal(received, answer) {
+		t.Fatalf("expected the answer %q, but got %q", answer, received)
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("error while closing the connection to the tunnel: %v", err)
+	}
+
+	// the error a connection going away gives to whoever is reading from it is
+	// reported by the goroutine carrying that direction, so all there is to do
+	// is give it the chance to do so.
+	time.Sleep(1 * time.Second)
+
+	for _, entry := range hook.AllEntries() {
+		if entry.Level != log.ErrorLevel {
+			continue
+		}
+
+		// the tunnels of the tests that ran before are still being torn down
+		// in the background, and complain about their own connections while
+		// they are at it, so only what was said about this one counts.
+		if !strings.Contains(fmt.Sprint(entry.Message, entry.Data), client) {
+			continue
+		}
+
+		t.Errorf("closing a connection should be quiet, but it logged: %s %v", entry.Message, entry.Data)
+	}
+}
+
 func TestRemoteTunnel(t *testing.T) {
-	c := &tunnelConfig{t, "remote", 1, true, NoSshRetries}
+	c := &tunnelConfig{T: t, TunnelType: "remote", Destinations: 1, Insecure: true, ConnectionRetries: NoSshRetries}
 	tun, _, _ := prepareTunnel(c)
 
 	select {
@@ -164,7 +467,7 @@ func TestRemoteTunnel(t *testing.T) {
 }
 
 func TestTunnelInsecure(t *testing.T) {
-	c := &tunnelConfig{t, "local", 1, true, NoSshRetries}
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 1, Insecure: true, ConnectionRetries: NoSshRetries}
 	tun, _, _ := prepareTunnel(c)
 
 	select {
@@ -184,7 +487,7 @@ func TestTunnelInsecure(t *testing.T) {
 }
 
 func TestTunnelMultipleDestinations(t *testing.T) {
-	c := &tunnelConfig{t, "local", 2, false, NoSshRetries}
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 2, Insecure: false, ConnectionRetries: NoSshRetries}
 	tun, _, _ := prepareTunnel(c)
 
 	select {
@@ -204,7 +507,7 @@ func TestTunnelMultipleDestinations(t *testing.T) {
 }
 
 func TestTunnelStopReleasesSourceEndpoints(t *testing.T) {
-	c := &tunnelConfig{t, "local", 2, false, NoSshRetries}
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 2, Insecure: false, ConnectionRetries: NoSshRetries}
 	tun, _, _ := prepareTunnel(c)
 
 	select {
@@ -240,7 +543,7 @@ func TestTunnelStopReleasesSourceEndpoints(t *testing.T) {
 // Stopping a tunnel gives up the source endpoints and the connection to the
 // ssh server for good, so it can't be started again.
 func TestTunnelCannotBeStartedAgain(t *testing.T) {
-	c := &tunnelConfig{t, "local", 1, false, NoSshRetries}
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 1, Insecure: false, ConnectionRetries: NoSshRetries}
 	tun, _, started := prepareTunnel(c)
 
 	select {
@@ -295,7 +598,7 @@ func waitForClosedEndpoint(address string, timeout time.Duration) error {
 }
 
 func TestReconnectSSHServer(t *testing.T) {
-	c := &tunnelConfig{t, "local", 1, false, 3}
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 1, Insecure: false, ConnectionRetries: 3}
 	tun, ssh, _ := prepareTunnel(c)
 
 	select {
@@ -344,7 +647,7 @@ func TestReconnectSSHServer(t *testing.T) {
 }
 
 func TestReconnectDoesNotPileUpGoroutines(t *testing.T) {
-	c := &tunnelConfig{t, "local", 2, false, 3}
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 2, Insecure: false, ConnectionRetries: 3}
 	tun, ssh, _ := prepareTunnel(c)
 
 	select {
@@ -413,7 +716,7 @@ func TestReconnectDoesNotPileUpGoroutines(t *testing.T) {
 // server and dies with it, so the tunnel has to create a new one, and serve it,
 // every time it reconnects.
 func TestRemoteChannelListensAgainAfterReconnection(t *testing.T) {
-	c := &tunnelConfig{t, "remote", 1, true, 3}
+	c := &tunnelConfig{T: t, TunnelType: "remote", Destinations: 1, Insecure: true, ConnectionRetries: 3}
 	tun, ssh, started := prepareTunnel(c)
 
 	select {
@@ -536,7 +839,7 @@ func TestTunnelFailsToStartWhenReconnectionIsDisabled(t *testing.T) {
 // A negative number of connection retries also means the tunnel must stop as
 // soon as the connection it is using is lost.
 func TestTunnelStopsWhenReconnectionIsDisabled(t *testing.T) {
-	c := &tunnelConfig{t, "local", 1, false, NoSshRetries}
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 1, Insecure: false, ConnectionRetries: NoSshRetries}
 	tun, ssh, started := prepareTunnel(c)
 
 	select {
@@ -567,7 +870,7 @@ func TestTunnelStopsWhenReconnectionIsDisabled(t *testing.T) {
 
 // Zero connection retries asks the tunnel to never give up on the ssh server.
 func TestTunnelNeverGivesUpReconnecting(t *testing.T) {
-	c := &tunnelConfig{t, "local", 1, false, 0}
+	c := &tunnelConfig{T: t, TunnelType: "local", Destinations: 1, Insecure: false, ConnectionRetries: 0}
 	tun, ssh, started := prepareTunnel(c)
 
 	select {
@@ -614,6 +917,7 @@ func TestTunnelNeverGivesUpReconnecting(t *testing.T) {
 const (
 	acceptFrame    = "tunnel.(*Tunnel).acceptConnections("
 	keepAliveFrame = "tunnel.(*Tunnel).keepAlive("
+	forwardFrame   = "tunnel.(*Tunnel).forward("
 )
 
 // countGoroutines returns the number of goroutines currently running the
@@ -813,6 +1117,11 @@ type tunnelConfig struct {
 	// tunnel.
 	Destinations int
 
+	// Destination is the address a local tunnel forwards to. An http server is
+	// created for every destination, and the tunnel wired to it, when no
+	// address is given.
+	Destination string
+
 	Insecure          bool
 	ConnectionRetries int
 }
@@ -842,15 +1151,31 @@ func prepareTunnel(config *tunnelConfig) (tun *Tunnel, ssh net.Listener, started
 
 	}
 
+	// only a local tunnel is wired to a destination given by the caller, so a
+	// test giving one to any other kind would be reaching an endpoint the
+	// tunnel is not forwarding to without ever hearing about it.
+	if config.Destination != "" && config.TunnelType != "local" {
+		config.T.Fatalf("a destination address can only be given to a local tunnel, not to a %s one", config.TunnelType)
+		return
+	}
+
 	source := make([]string, config.Destinations)
 	destination := make([]string, config.Destinations)
 
 	for i := 0; i <= (config.Destinations - 1); i++ {
-		l, _ := createHttpServer()
 		if config.TunnelType == "local" {
+			address := config.Destination
+
+			if address == "" {
+				l, _ := createHttpServer()
+				address = l.Addr().String()
+			}
+
 			source[i] = "127.0.0.1:0"
-			destination[i] = l.Addr().String()
+			destination[i] = address
 		} else if config.TunnelType == "remote" {
+			l, _ := createHttpServer()
+
 			source[i] = l.Addr().String()
 			destination[i] = "127.0.0.1:0"
 		} else {
@@ -961,6 +1286,36 @@ func createHttpServer() (net.Listener, *http.Server) {
 	go server.Serve(l)
 
 	return l, server
+}
+
+// createTCPServer spawns a tcp server, listening on a random port, that hands
+// every connection made to it over to the given handler and closes it once the
+// handler is done with it.
+//
+// Unlike createHttpServer, it says nothing about how much data is coming, so a
+// client can only tell a response is complete by reading all of it.
+func createTCPServer(handler func(conn net.Conn)) (net.Listener, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+
+			go func() {
+				defer conn.Close()
+
+				handler(conn)
+			}()
+		}
+	}()
+
+	return l, nil
 }
 
 // createSSHServer starts a SSH server that authenticates connections using
@@ -1090,12 +1445,23 @@ func createSSHServer(t *testing.T, address string, keyPath string) (net.Listener
 							return
 						}
 
+						// the end of the stream is told to the other end of the
+						// connection, as a real ssh server does, so that a
+						// client whose endpoint is done, or an endpoint whose
+						// client is done, hears about it instead of waiting
+						// for data that is never coming.
 						go func() {
 							io.Copy(conn, remoteConn)
+
+							conn.CloseWrite()
 						}()
 
 						go func() {
 							io.Copy(remoteConn, conn)
+
+							if tcp, ok := remoteConn.(*net.TCPConn); ok {
+								tcp.CloseWrite()
+							}
 						}()
 					}(newChan)
 				}

@@ -189,9 +189,9 @@ func TestDynamicTunnelRepliesWhileThereIsNoSSHConnection(t *testing.T) {
 	// state it is in while reconnecting to it. The connection is given back
 	// before the tunnel is stopped so that it is closed along with everything
 	// else.
-	client := tun.sshClient()
-	defer tun.setSSHClient(client)
-	tun.setSSHClient(nil)
+	client, disconnected := tun.sshConnection()
+	defer tun.setSSHClient(client, disconnected)
+	tun.setSSHClient(nil, nil)
 
 	conn, err := socksGreet(tun.channels[0].address())
 	if err != nil {
