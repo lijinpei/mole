@@ -49,5 +49,13 @@ func init() {
 		os.Exit(1)
 	}
 
+	// a remote tunnel serves no socks proxy, so there is nobody to
+	// authenticate.
+	err = addAliasRemoteCmd.Flags().MarkHidden("socks-auth")
+	if err != nil {
+		log.WithError(err).Error("error parsing command line arguments")
+		os.Exit(1)
+	}
+
 	addAliasCmd.AddCommand(addAliasRemoteCmd)
 }

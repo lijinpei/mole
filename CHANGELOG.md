@@ -21,8 +21,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as well, since they name what only that side can reach, and a `RemoteForward`
   carrying a source endpoint alone is read from the SSH config file when no
   `--source` is given, the same way `ssh -R 1080` asks for one
+- `--socks-auth <user>:<password>` makes the SOCKS5 proxy of a dynamic or a
+  reverse dynamic tunnel ask its clients to authenticate, which matters most for
+  a reverse dynamic one: its endpoint is served by the ssh server, so whoever
+  reaches that server reaches the proxy. A value starting with `$` names the
+  environment variable carrying the credentials, so the password is neither
+  given on the command line nor kept in the alias file, and it is left out of
+  what an instance reports about itself
 
 ### Fixed
+- A tunnel that cannot listen on the endpoints it asks the ssh server for no
+  longer gives up for good. The connection retries were only spent on reaching
+  the server, so a tunnel reconnecting to a server that had not released the
+  endpoint of the connection that just died stopped instead of asking for it
+  again a moment later. An endpoint on the machine mole runs on is still taken
+  for good, since asking again does not take it from whoever holds it
+- The connection to the ssh server is now established by a single goroutine from
+  the first connection to the last. A connection lost while another one was
+  being established had a second one start alongside it, leaving the tunnel with
+  a connection and a set of listeners nothing was watching, and a tunnel stopped
+  while connecting could leave both behind after `Start` had already returned
+- The address a socks proxy reached an endpoint from is no longer reported back
+  to the client that asked for it. A reverse dynamic tunnel reaches addresses
+  from the machine it runs on, so its clients, which are on the other side of
+  the ssh server, were told about that machine's network one address at a time
+- A socks proxy no longer waits for a connection that never answers for as long
+  as the operating system takes to give up, which is a couple of minutes: a
+  client asking for addresses that swallow what is sent to them held everything
+  serving it for that long at no cost to itself
 - A tunnel listening on the ssh server no longer turns a source address naming a
   host into `0.0.0.0`. The endpoint was taken from the listener, which reports
   the address it could parse rather than the one it asked for, so a `--source

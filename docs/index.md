@@ -214,8 +214,9 @@ $ curl --socks5-hostname 127.0.0.1:1080 http://intranet.example
 ```
 
 Only the `CONNECT` command is supported, since a ssh tunnel carries tcp alone,
-and no authentication is required to use the proxy, so the source endpoint
-should be kept on an address only trusted clients can reach.
+and the source endpoint should be kept on an address only trusted clients can
+reach, or the proxy told to ask its clients for a user and a password with
+`--socks-auth <user>:<password>`.
 
 ## Expose many services to someone outside your network
 
@@ -259,9 +260,22 @@ Any client that speaks SOCKS5 can then reach this side of the tunnel through
 $ curl --socks5-hostname 127.0.0.1:1080 http://intranet.example
 ```
 
-Only the `CONNECT` command is supported here as well, and no authentication is
-required to use the proxy, so whoever reaches the source endpoint reaches
-everything the computer running **Mole** can.
+Only the `CONNECT` command is supported here as well, and whoever reaches the
+source endpoint reaches everything the computer running **Mole** can, so the
+proxy can be told to ask its clients for a user and a password:
+
+```sh
+$ MOLE_SOCKS_AUTH='mole:the-password' mole start reverse-dynamic \
+  --source 127.0.0.1:1080 \
+  --socks-auth '$MOLE_SOCKS_AUTH' \
+  --server user@172.17.0.100
+```
+
+A value starting with `$` names the environment variable carrying the
+credentials, so that the password is neither given on the command line, where
+anyone looking at the process list can read it, nor kept in the alias file.
+Without `--socks-auth` the proxy serves whoever reaches it, which is what
+`ssh -R` does.
 
 Which address that endpoint ends up bound to is the **jump server**'s decision
 rather than Mole's, and `--source` is only what gets asked for: `sshd` keeps the

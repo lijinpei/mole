@@ -46,6 +46,12 @@ provide 0 to never give up or a negative number to disable`)
 	cmd.Flags().StringVarP(&conf.SshConfig, "config", "c", "$HOME/.ssh/config", "set config file path")
 	cmd.Flags().DurationVarP(&conf.WaitAndRetry, "retry-wait", "w", 3*time.Second, "time to wait before trying to reconnect to ssh server")
 	cmd.Flags().StringVarP(&conf.SshAgent, "ssh-agent", "A", "", "unix socket to communicate with a ssh agent")
+	cmd.Flags().StringVarP(&conf.SocksAuth, "socks-auth", "", "", `require the clients of the socks5 proxy served by a dynamic
+or a reverse dynamic tunnel to authenticate with the given
+<user>:<password>. A value starting with $ names the
+environment variable carrying it, so that the password is
+neither given on the command line nor kept in the alias file.
+The proxy serves whoever reaches it when nothing is given.`)
 	cmd.Flags().DurationVarP(&conf.Timeout, "timeout", "t", 3*time.Second, "ssh server connection timeout")
 	cmd.Flags().BoolVarP(&conf.Rpc, "rpc", "", false, "enable the rpc server")
 	cmd.Flags().StringVarP(&conf.RpcAddress, "rpc-address", "", "127.0.0.1:0", `set the network address of the rpc server.

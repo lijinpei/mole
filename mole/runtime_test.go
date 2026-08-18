@@ -23,6 +23,7 @@ wait-and-retry = "0s"
 ssh-agent = ""
 timeout = "0s"
 ssh-config = ""
+socks-auth = ""
 rpc = false
 rpc-address = ""
 
@@ -45,6 +46,7 @@ const expectedMultipleInstances string = `[instances]
     ssh-agent = ""
     timeout = "0s"
     ssh-config = ""
+    socks-auth = ""
     rpc = false
     rpc-address = ""
     [instances.id1.server]
@@ -64,6 +66,7 @@ const expectedMultipleInstances string = `[instances]
     ssh-agent = ""
     timeout = "0s"
     ssh-config = ""
+    socks-auth = ""
     rpc = false
     rpc-address = ""
     [instances.id2.server]
@@ -125,6 +128,28 @@ func TestRuntimeOfDynamicTunnel(t *testing.T) {
 		if len(rt.Destination) != 0 {
 			t.Errorf("expected no destination to be reported for a %s tunnel, but got %d: %q", tunnelType, len(rt.Destination), rt.Destination.List())
 		}
+	}
+}
+
+// What an instance tells about itself is asked for through the rpc server and
+// printed by "mole show", so the credentials its socks proxy asks its clients
+// for have no place in it.
+func TestRuntimeDoesNotReportSocksCredentials(t *testing.T) {
+	conf := &mole.Configuration{Id: "socks-runtime", SocksAuth: "mole:let me in"}
+	client := mole.Client{Conf: conf}
+
+	rt, err := client.Runtime()
+	if err != nil {
+		t.Fatalf("error while reading the runtime information: %v", err)
+	}
+
+	if rt.SocksAuth != "" {
+		t.Errorf("the runtime information carries the socks credentials: %s", rt.SocksAuth)
+	}
+
+	// what the instance is running with is left alone: only what it reports is.
+	if conf.SocksAuth == "" {
+		t.Errorf("the configuration of the instance lost its socks credentials")
 	}
 }
 

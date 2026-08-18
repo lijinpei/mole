@@ -33,6 +33,11 @@ const NoSshRetries = -1
 // made from the machine the tunnel runs on.
 var addressesReached atomic.Int64
 
+// forwardsDenied tells how many endpoints the test ssh servers have to refuse
+// to listen on before serving them, which is what a server that has not
+// released the endpoint of a connection that just died does.
+var forwardsDenied atomic.Int64
+
 var sshDir string
 var keyPath string
 var encryptedKeyPath string
@@ -1415,6 +1420,17 @@ func createSSHServer(t *testing.T, address string, keyPath string) (net.Listener
 				for newReq := range reqs {
 					switch newReq.Type {
 					case "tcpip-forward":
+						// an endpoint a test asked to have refused stands for
+						// one the server is still holding for a connection that
+						// just died, which it gives up in a moment.
+						if forwardsDenied.Load() > 0 {
+							forwardsDenied.Add(-1)
+
+							newReq.Reply(false, nil) //nolint: errcheck
+
+							continue
+						}
+
 						listener, host, port, err := listenForward(newReq.Payload)
 						if err != nil {
 							newReq.Reply(false, nil) //nolint: errcheck

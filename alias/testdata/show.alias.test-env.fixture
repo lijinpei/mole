@@ -13,5 +13,6 @@ wait-and-retry = "3s"
 ssh-agent = ""
 timeout = "3s"
 config = ""
+socks-auth = ""
 rpc = true
 rpc-address = "127.0.0.1:0"

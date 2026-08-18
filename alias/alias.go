@@ -28,6 +28,7 @@ type Alias struct {
 	SshAgent          string   `toml:"ssh-agent"`
 	Timeout           string   `toml:"timeout"`
 	SshConfig         string   `toml:"config"`
+	SocksAuth         string   `toml:"socks-auth"`
 	Rpc               bool     `toml:"rpc"`
 	RpcAddress        string   `toml:"rpc-address"`
 }

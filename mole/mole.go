@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -50,8 +51,12 @@ type Configuration struct {
 	SshAgent          string           `json:"ssh-agent" mapstructure:"ssh-agent" toml:"ssh-agent"`
 	Timeout           time.Duration    `json:"timeout" mapstructure:"timeout" toml:"timeout"`
 	SshConfig         string           `json:"ssh-config" mapstructure:"ssh-config" toml:"ssh-config"`
-	Rpc               bool             `json:"rpc" mapstructure:"rpc" toml:"rpc"`
-	RpcAddress        string           `json:"rpc-address" mapstructure:"rpc-address" toml:"rpc-address"`
+	// SocksAuth carries the <user>:<password> the clients of the socks proxy
+	// served by a dynamic or a reverse dynamic tunnel have to authenticate
+	// with, or the name of the environment variable holding it.
+	SocksAuth  string `json:"socks-auth" mapstructure:"socks-auth" toml:"socks-auth"`
+	Rpc        bool   `json:"rpc" mapstructure:"rpc" toml:"rpc"`
+	RpcAddress string `json:"rpc-address" mapstructure:"rpc-address" toml:"rpc-address"`
 }
 
 // ParseAlias translates a Configuration object to an Alias object.
@@ -72,6 +77,7 @@ func (c Configuration) ParseAlias(name string) *alias.Alias {
 		SshAgent:          c.SshAgent,
 		Timeout:           c.Timeout.String(),
 		SshConfig:         c.SshConfig,
+		SocksAuth:         c.SocksAuth,
 		Rpc:               c.Rpc,
 		RpcAddress:        c.RpcAddress,
 	}
@@ -337,6 +343,8 @@ func (c *Configuration) Merge(al *alias.Alias, givenFlags []string) error {
 		c.SshConfig = al.SshConfig
 	}
 
+	c.SocksAuth = al.SocksAuth
+
 	c.Rpc = al.Rpc
 
 	c.RpcAddress = al.RpcAddress
@@ -490,6 +498,12 @@ func createTunnel(conf *Configuration) (*tunnel.Tunnel, error) {
 		return nil, err
 	}
 
+	t.SocksUser, t.SocksPassword, err = socksCredentials(conf.SocksAuth)
+	if err != nil {
+		log.Error(err)
+		return nil, err
+	}
+
 	//TODO need to find a way to require the attributes below to be always set
 	// since they are not optional (functionality will break if they are not
 	// set and CLI parsing is the one setting the default values).
@@ -500,6 +514,33 @@ func createTunnel(conf *Configuration) (*tunnel.Tunnel, error) {
 	t.KeepAliveInterval = conf.KeepAliveInterval
 
 	return t, nil
+}
+
+// socksCredentials splits the user name and the password the clients of a socks
+// proxy have to authenticate with out of the value given to the socks-auth
+// setting. Both are empty when no value was given, which asks for a proxy that
+// serves whoever reaches it.
+//
+// A value naming an environment variable is read from it, the same way the ssh
+// agent address is, so that a password does not have to be given on the command
+// line, where anyone looking at the process list can read it, nor kept in the
+// alias file.
+func socksCredentials(auth string) (string, string, error) {
+	if strings.HasPrefix(auth, "$") {
+		auth = os.Getenv(auth[1:])
+	}
+
+	if auth == "" {
+		return "", "", nil
+	}
+
+	user, password, given := strings.Cut(auth, ":")
+
+	if !given || user == "" || password == "" {
+		return "", "", fmt.Errorf("socks authentication has to be given as <user>:<password>")
+	}
+
+	return user, password, nil
 }
 
 // appendIdArg adds the id argument to the list of arguments passed by the user.

@@ -28,8 +28,9 @@ Host names are resolved by the jump server rather than locally, so names that
 only exist in the remote network can be used.
 
 Only the CONNECT command is supported, which is what a ssh tunnel is able to
-carry, and no authentication is required to connect to the proxy, so the source
-endpoint should be kept on an address reachable by trusted clients alone.
+carry, and the source endpoint should be kept on an address reachable by trusted
+clients alone, or the proxy told to ask its clients for a user and a password
+through the --socks-auth flag.
 `
 )
 

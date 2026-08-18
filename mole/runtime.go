@@ -70,6 +70,11 @@ func (ir InstancesRuntime) ToToml() (string, error) {
 func (c *Client) Runtime() (*Runtime, error) {
 	runtime := Runtime(*c.Conf)
 
+	// the credentials the socks proxy asks its clients for are not part of what
+	// an instance tells about itself: whoever is looking at what it is doing has
+	// no use for them.
+	runtime.SocksAuth = ""
+
 	if c.Tunnel != nil {
 		source := &AddressInputList{}
 		destination := &AddressInputList{}

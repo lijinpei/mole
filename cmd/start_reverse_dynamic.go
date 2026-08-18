@@ -29,8 +29,9 @@ Host names are resolved by this machine rather than by the jump server, since
 they name what only this side can reach.
 
 Only the CONNECT command is supported, which is what a ssh tunnel is able to
-carry, and no authentication is required to connect to the proxy, so anyone able
-to reach the source endpoint can reach anything this machine can.
+carry, and anyone able to reach the source endpoint can reach anything this
+machine can, so the proxy can be told to ask its clients for a user and a
+password through the --socks-auth flag.
 
 Which address the endpoint is bound to is decided by the jump server rather than
 here, and the source address is only what gets asked for: a ssh server keeps it

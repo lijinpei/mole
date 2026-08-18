@@ -324,22 +324,60 @@ type Tunnel struct {
 	// server
 	WaitAndRetry time.Duration
 
+	// SocksUser and SocksPassword are what the clients of the socks proxy
+	// served by a dynamic or a reverse dynamic tunnel have to authenticate
+	// with. While there is no user, every client is served without being asked
+	// for anything, which is what a ssh tunnel offers on its own.
+	SocksUser     string
+	SocksPassword string
+
 	server   *Server
 	channels []*SSHChannel
 	done     chan error
-	// client is replaced on every reconnection while the goroutines serving
-	// the channels keep running, so it must only be reached through
-	// sshConnection and setSSHClient.
-	client *ssh.Client
-	// disconnected is closed as soon as the connection to the ssh server held
-	// in client is gone, and is replaced along with it.
-	disconnected <-chan struct{}
-	clientMutex  sync.RWMutex
-	reconnect    chan error
+	// conn is replaced on every reconnection while the goroutines serving the
+	// channels keep running, so it must only be reached through connection and
+	// setConnection.
+	conn      *serverConnection
+	connMutex sync.RWMutex
 	// stop is closed when the tunnel is shutting down, telling the channel
 	// goroutines that any error they get from that point on is expected.
 	stop     chan struct{}
 	stopOnce sync.Once
+}
+
+// serverConnection is a connection to the ssh server along with what everything
+// established on it needs to know about its fate: a listener, a forwarded
+// connection or a socks server can only outlive it for as long as it takes to
+// hear that it is gone.
+type serverConnection struct {
+	client *ssh.Client
+	// gone is closed as soon as the connection is over, which is how everything
+	// established on it is told to let go.
+	gone chan struct{}
+	// err tells what ended the connection. It is written before gone is closed,
+	// so whoever saw it closed can read it.
+	err error
+}
+
+// sshClient returns the connection to the ssh server, which is nil when there
+// is no connection at all.
+func (c *serverConnection) sshClient() *ssh.Client {
+	if c == nil {
+		return nil
+	}
+
+	return c.client
+}
+
+// disconnected returns the signal telling when the connection is gone, which is
+// nil when there is no connection at all: nothing can be bound to one that does
+// not exist.
+func (c *serverConnection) disconnected() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+
+	return c.gone
 }
 
 // New creates a new instance of Tunnel.
@@ -371,13 +409,12 @@ func New(tunnelType string, server *Server, source, destination []string, config
 	}
 
 	t := &Tunnel{
-		Type:      tunnelType,
-		Ready:     make(chan bool, 1),
-		channels:  channels,
-		server:    server,
-		reconnect: make(chan error, 1),
-		done:      make(chan error, 1),
-		stop:      make(chan struct{}),
+		Type:     tunnelType,
+		Ready:    make(chan bool, 1),
+		channels: channels,
+		server:   server,
+		done:     make(chan error, 1),
+		stop:     make(chan struct{}),
 	}
 
 	return t, nil
@@ -386,30 +423,24 @@ func New(tunnelType string, server *Server, source, destination []string, config
 // sshClient returns the connection to the ssh server currently in use, which
 // is nil while the tunnel has none.
 func (t *Tunnel) sshClient() *ssh.Client {
-	client, _ := t.sshConnection()
-
-	return client
+	return t.connection().sshClient()
 }
 
-// sshConnection returns the connection to the ssh server currently in use
-// along with the channel that is closed as soon as that very connection is
-// gone, which is how everything bound to it hears it has to stop. Both are nil
-// while the tunnel has no connection.
-func (t *Tunnel) sshConnection() (*ssh.Client, <-chan struct{}) {
-	t.clientMutex.RLock()
-	defer t.clientMutex.RUnlock()
+// connection returns the connection to the ssh server currently in use, which
+// is nil while the tunnel has none.
+func (t *Tunnel) connection() *serverConnection {
+	t.connMutex.RLock()
+	defer t.connMutex.RUnlock()
 
-	return t.client, t.disconnected
+	return t.conn
 }
 
-// setSSHClient sets the connection to the ssh server to be used from now on,
-// together with the channel telling when that connection is gone.
-func (t *Tunnel) setSSHClient(client *ssh.Client, disconnected <-chan struct{}) {
-	t.clientMutex.Lock()
-	defer t.clientMutex.Unlock()
+// setConnection sets the connection to the ssh server to be used from now on.
+func (t *Tunnel) setConnection(conn *serverConnection) {
+	t.connMutex.Lock()
+	defer t.connMutex.Unlock()
 
-	t.client = client
-	t.disconnected = disconnected
+	t.conn = conn
 }
 
 // Start creates the ssh tunnel and initialized all channels allowing data
@@ -421,41 +452,77 @@ func (t *Tunnel) Start() error {
 
 	log.Debugf("tunnel: %s", t)
 
-	t.connect()
+	// the connection to the ssh server, and the channels served on it, are
+	// established by a single goroutine from the first connection to the last,
+	// so that a reconnection can never start while another one is still going
+	// on, and so that stopping the tunnel does not have to wait for one to be
+	// over.
+	go t.serve()
 
+	return t.shutdown(<-t.done)
+}
+
+// serve keeps the tunnel connected to the ssh server, and its channels serving
+// on the connection in use, reconnecting for as long as the tunnel is allowed
+// to, and reports whatever ends it to Start.
+func (t *Tunnel) serve() {
 	for {
-		select {
-		case err := <-t.reconnect:
-			if err == nil {
-				continue
+		if err := t.connect(); err != nil {
+			// a tunnel that is shutting down is what interrupted the
+			// connection, and is already on its way out, so there is nobody
+			// left to report anything to.
+			if !t.stopping() {
+				t.done <- err
 			}
 
-			if t.reconnectionDisabled() {
-				log.WithError(err).Error("connection to the ssh server is gone and reconnection is disabled")
-
-				return t.shutdown(err)
-			}
-
-			log.WithError(err).Warnf("reconnecting to ssh server")
-
-			if client := t.sshClient(); client != nil {
-				client.Close()
-			}
-
-			log.Debugf("restablishing the tunnel after disconnection: %s", t)
-
-			// The reconnecion must happens on a goroutine to support the scenario
-			// where tunnel.Stop() is called while the tunnel.connect() is getting
-			// executed.
-			//
-			// In an event where tunnel.reconnect receives data from any point of the
-			// code rather than tunnel.dial(), which is evoked by tunnel.connect()
-			// this code needs to be updated to make sure tunnel.connect() is not
-			// schedule in two goroutines at the same time.
-			go t.connect()
-		case err := <-t.done:
-			return t.shutdown(err)
+			return
 		}
+
+		conn := t.connection()
+
+		// the tunnel may have been stopped while this connection was being
+		// established, in which case the shutdown released what there was at
+		// the time and this is the only place left that knows about it.
+		if t.stopping() {
+			t.release()
+
+			return
+		}
+
+		// The tunnel is ready as soon as the listeners are bound: connections
+		// established before the goroutines serving them get to call Accept just
+		// wait on the listener backlog.
+		//
+		// The signal is best effort, otherwise a tunnel reconnecting more than
+		// once would get stuck here whenever no one is consuming Ready.
+		select {
+		case t.Ready <- true:
+		default:
+		}
+
+		// waiting on the connection that was just established, rather than on a
+		// signal shared by every connection, is what keeps one that is already
+		// gone from being taken for the one in use.
+		select {
+		case <-conn.gone:
+		case <-t.stop:
+			return
+		}
+
+		if t.reconnectionDisabled() {
+			err := fmt.Errorf("connection to the ssh server is gone and reconnection is disabled: %v", conn.err)
+
+			log.WithError(conn.err).Error("connection to the ssh server is gone and reconnection is disabled")
+
+			if !t.stopping() {
+				t.done <- err
+			}
+
+			return
+		}
+
+		log.WithError(conn.err).Warnf("reconnecting to ssh server")
+		log.Debugf("restablishing the tunnel after disconnection: %s", t)
 	}
 }
 
@@ -469,15 +536,21 @@ func (t *Tunnel) shutdown(err error) error {
 		close(t.stop)
 	})
 
-	// the listeners of remote channels live on the ssh connection, so they must
-	// be closed before the ssh client.
+	t.release()
+
+	return err
+}
+
+// release lets go of the endpoints the channels are listening on and of the
+// connection to the ssh server.
+func (t *Tunnel) release() {
+	// the listeners of the channels that listen on the ssh server live on the
+	// connection to it, so they must be closed before the connection.
 	t.closeChannels()
 
 	if client := t.sshClient(); client != nil {
 		client.Close()
 	}
-
-	return err
 }
 
 // reconnectionDisabled tells whether the tunnel should give up on the ssh
@@ -496,10 +569,10 @@ func (t *Tunnel) reconnectionDisabled() bool {
 // goroutine to serve it, since the previous listener died with the connection
 // it was created on.
 func (t *Tunnel) Listen() error {
-	client, disconnected := t.sshConnection()
+	conn := t.connection()
 
 	for _, ch := range t.channels {
-		listener, err := ch.Listen(client)
+		listener, err := ch.Listen(conn.sshClient())
 		if err != nil {
 			return err
 		}
@@ -525,7 +598,7 @@ func (t *Tunnel) Listen() error {
 		// one before an address is reached through it.
 		var listenerDisconnected <-chan struct{}
 		if serverListener(ch.ChannelType) {
-			listenerDisconnected = disconnected
+			listenerDisconnected = conn.disconnected()
 		}
 
 		go t.acceptConnections(ch, listener, listenerDisconnected)
@@ -586,15 +659,17 @@ func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn, disconnected <
 
 		return nil
 	case "local":
-		var client *ssh.Client
+		conn := t.connection()
+
+		client := conn.sshClient()
+		if client == nil {
+			return fmt.Errorf("tunnel channel can't be established: missing connection to the ssh server")
+		}
 
 		// the connection made to the source endpoint is a plain socket that
 		// outlives any connection to the ssh server, so what carries it is the
 		// one the destination is about to be dialed from.
-		client, disconnected = t.sshConnection()
-		if client == nil {
-			return fmt.Errorf("tunnel channel can't be established: missing connection to the ssh server")
-		}
+		disconnected = conn.disconnected()
 
 		destinationConn, err = client.Dial("tcp", channel.Destination)
 	case "remote":
@@ -730,7 +805,7 @@ func (t *Tunnel) serveSocks(channel *SSHChannel, conn net.Conn, disconnected <-c
 	// the socks server is made for this connection alone, so that what it
 	// reaches the address asked for with, and the connection to the ssh server
 	// it was reached through, are known to whoever is serving this one.
-	err := newSocksServer(dialer(dialed)).ServeConn(conn)
+	err := newSocksServer(dialer(dialed), t.socksCredentials()).ServeConn(conn)
 	if err == nil {
 		return
 	}
@@ -762,10 +837,12 @@ func (t *Tunnel) String() string {
 	return fmt.Sprintf("[channels:%s, server:%s]", t.channels, t.server.Address)
 }
 
+// dial establishes a connection to the ssh server, letting go of the one in
+// use, if any, and watches the one it establishes for as long as it lives.
 func (t *Tunnel) dial() error {
 	if client := t.sshClient(); client != nil {
 		client.Close()
-		t.setSSHClient(nil, nil)
+		t.setConnection(nil)
 	}
 
 	c, err := sshClientConfig(*t.server)
@@ -773,47 +850,22 @@ func (t *Tunnel) dial() error {
 		return fmt.Errorf("error generating ssh client config: %s", err)
 	}
 
-	var client *ssh.Client
+	client, err := ssh.Dial("tcp", t.server.Address, c)
+	if err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"server": t.server,
+		}).Error("error while connecting to ssh server")
 
-	retries := 0
-	for {
-		if t.ConnectionRetries > 0 && retries == t.ConnectionRetries {
-			log.WithFields(log.Fields{
-				"server":  t.server,
-				"retries": retries,
-			}).Error("maximum number of connection retries to the ssh server reached")
-
-			return fmt.Errorf("error while connecting to ssh server")
-		}
-
-		client, err = ssh.Dial("tcp", t.server.Address, c)
-		if err != nil {
-			log.WithError(err).WithFields(log.Fields{
-				"server":  t.server,
-				"retries": retries,
-			}).Error("error while connecting to ssh server")
-
-			if t.reconnectionDisabled() {
-				return fmt.Errorf("error while connecting to ssh server: %v", err)
-			}
-
-			retries = retries + 1
-
-			time.Sleep(t.WaitAndRetry)
-			continue
-		}
-
-		break
+		return fmt.Errorf("error while connecting to ssh server: %v", err)
 	}
 
-	// disconnected is closed as soon as the connection just established is
-	// gone, so that everything bound to it stops with it rather than through a
-	// signal a later connection could end up consuming. It is handed over along
-	// with the connection so that whoever picks one up gets the signal that
-	// belongs to it.
-	disconnected := make(chan struct{})
+	// the signal telling when the connection is gone is kept along with it, so
+	// that everything established on it stops with it rather than through a
+	// signal a later connection could end up consuming, and so that whoever
+	// picks a connection up gets the signal that belongs to it.
+	conn := &serverConnection{client: client, gone: make(chan struct{})}
 
-	t.setSSHClient(client, disconnected)
+	t.setConnection(conn)
 
 	// both goroutines below are bound to the connection just established, so
 	// they are given it instead of reaching for whatever connection the tunnel
@@ -822,8 +874,8 @@ func (t *Tunnel) dial() error {
 	// The connection is watched whatever the retry configuration is: the tunnel
 	// can only forward anything while it is up, so its loss either starts a
 	// reconnection or ends the tunnel.
-	go t.keepAlive(client, disconnected)
-	go t.watchConnection(client, disconnected)
+	go t.keepAlive(conn)
+	go t.watchConnection(conn)
 
 	log.WithFields(log.Fields{
 		"server": t.server,
@@ -833,39 +885,67 @@ func (t *Tunnel) dial() error {
 }
 
 // watchConnection waits for the given connection to be gone, telling everything
-// bound to it to stop before reporting the loss to Start.
-func (t *Tunnel) watchConnection(client *ssh.Client, disconnected chan<- struct{}) {
-	err := client.Wait()
+// established on it to let go.
+func (t *Tunnel) watchConnection(conn *serverConnection) {
+	conn.err = conn.client.Wait()
 
-	close(disconnected)
+	log.WithError(conn.err).WithFields(log.Fields{
+		"server": t.server,
+	}).Debug("connection to the ssh server is gone")
 
-	t.reconnect <- err
+	close(conn.gone)
 }
 
-func (t *Tunnel) connect() {
-	var err error
+// connect establishes a connection to the ssh server and starts serving the
+// channels of the tunnel on it, trying again for as long as the tunnel was told
+// to before giving up.
+func (t *Tunnel) connect() error {
+	retries := 0
 
-	err = t.dial()
-	if err != nil {
-		t.done <- err
-		return
-	}
+	for {
+		err := t.dial()
+		if err == nil {
+			if err = t.Listen(); err == nil {
+				return nil
+			}
 
-	err = t.Listen()
-	if err != nil {
-		t.done <- err
-		return
-	}
+			log.WithError(err).WithFields(log.Fields{
+				"server": t.server,
+			}).Error("error while listening on the tunnel endpoints")
 
-	// The tunnel is ready as soon as the listeners are bound: connections
-	// established before the goroutines serving them get to call Accept just
-	// wait on the listener backlog.
-	//
-	// The signal is best effort, otherwise a tunnel reconnecting more than once
-	// would get stuck here whenever no one is consuming Ready.
-	select {
-	case t.Ready <- true:
-	default:
+			// an endpoint on this machine is taken by whoever holds it, which
+			// asking for it again does not change, while one the ssh server
+			// listens on may still be held by the connection that just died and
+			// is given up in a moment, so it is asked for again the same way the
+			// connection to the server is.
+			if !serverListener(t.Type) {
+				return err
+			}
+		}
+
+		if t.reconnectionDisabled() {
+			return err
+		}
+
+		retries = retries + 1
+
+		if t.ConnectionRetries > 0 && retries >= t.ConnectionRetries {
+			log.WithFields(log.Fields{
+				"server":  t.server,
+				"retries": retries,
+			}).Error("maximum number of connection retries to the ssh server reached")
+
+			return err
+		}
+
+		// waiting is also the last chance to hear that the tunnel is stopping
+		// before spending another attempt on one that nobody is waiting for
+		// anymore.
+		select {
+		case <-time.After(t.WaitAndRetry):
+		case <-t.stop:
+			return err
+		}
 	}
 }
 
@@ -941,7 +1021,7 @@ func (t *Tunnel) stopping() bool {
 }
 
 // keepAlive pings the given connection to the ssh server until it is gone.
-func (t *Tunnel) keepAlive(client *ssh.Client, disconnected <-chan struct{}) {
+func (t *Tunnel) keepAlive(conn *serverConnection) {
 	ticker := time.NewTicker(t.KeepAliveInterval)
 	defer ticker.Stop()
 
@@ -950,11 +1030,11 @@ func (t *Tunnel) keepAlive(client *ssh.Client, disconnected <-chan struct{}) {
 	for {
 		select {
 		case <-ticker.C:
-			_, _, err := client.SendRequest("keepalive@mole", true, nil)
+			_, _, err := conn.client.SendRequest("keepalive@mole", true, nil)
 			if err != nil {
 				log.Warnf("error sending keep-alive request to ssh server: %v", err)
 			}
-		case <-disconnected:
+		case <-conn.gone:
 			log.Debug("stop sending keep alive packets")
 			return
 		}
