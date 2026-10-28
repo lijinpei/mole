@@ -1,0 +1,37 @@
+name = "multi"
+verbose = true
+insecure = false
+detach = false
+key = "path/to/key"
+keep-alive-interval = "10s"
+connection-retries = 3
+wait-and-retry = "3s"
+ssh-agent = ""
+timeout = "5s"
+config = "$HOME/.ssh/config"
+socks-auth = ""
+rpc = true
+rpc-address = "127.0.0.1:0"
+
+[[tunnels]]
+  server = "mole@bastion-a"
+
+  [[tunnels.forwards]]
+    type = "local"
+    source = [":8080"]
+    destination = ["db:5432"]
+
+  [[tunnels.forwards]]
+    type = "dynamic"
+    source = [":1080"]
+
+[[tunnels]]
+  server = "mole@bastion-b:2222"
+  key = "path/to/other/key"
+  connection-retries = 0
+  insecure = true
+
+  [[tunnels.forwards]]
+    type = "remote"
+    source = ["0.0.0.0:9000"]
+    destination = ["127.0.0.1:3000"]

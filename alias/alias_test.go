@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/davrodpin/mole/alias"
@@ -51,7 +52,7 @@ func TestAddThenGetThenDeleteAlias(t *testing.T) {
 }
 
 func TestShow(t *testing.T) {
-	ids := []string{"test-env"}
+	ids := []string{"test-env", "multi"}
 	fx, err := filepath.Abs(FixtureDir)
 	if err != nil {
 		t.Errorf("error while loading data for TestShow: %v", err)
@@ -170,7 +171,7 @@ func setup() (string, error) {
 		return "", err
 	}
 
-	fixtures := []string{"test-env.toml", "example.toml"}
+	fixtures := []string{"test-env.toml", "example.toml", "multi.toml"}
 	for _, fixture := range fixtures {
 		err = CopyFile(filepath.Join(fx, fixture), filepath.Join(moleAliasDir, fixture))
 		if err != nil {
@@ -206,4 +207,161 @@ func CopyFile(sourcePath, destPath string) error {
 	}
 
 	return nil
+}
+
+func TestGetMultiTunnelAlias(t *testing.T) {
+	insecure := true
+	never := 0
+
+	// the settings the alias leaves out take the values the command line
+	// defaults to.
+	expected := &alias.Alias{
+		Name:              "multi",
+		Verbose:           true,
+		Key:               "path/to/key",
+		KeepAliveInterval: alias.DefaultKeepAliveInterval,
+		ConnectionRetries: alias.DefaultConnectionRetries,
+		WaitAndRetry:      alias.DefaultWaitAndRetry,
+		Timeout:           "5s",
+		SshConfig:         alias.DefaultSshConfig,
+		Rpc:               true,
+		RpcAddress:        "127.0.0.1:0",
+		Tunnels: []alias.Tunnel{
+			{
+				Server: "mole@bastion-a",
+				Forwards: []alias.Forward{
+					{Type: "local", Source: []string{":8080"}, Destination: []string{"db:5432"}},
+					{Type: "dynamic", Source: []string{":1080"}},
+				},
+			},
+			{
+				Server:            "mole@bastion-b:2222",
+				Key:               "path/to/other/key",
+				Insecure:          &insecure,
+				ConnectionRetries: &never,
+				Forwards: []alias.Forward{
+					{Type: "remote", Source: []string{"0.0.0.0:9000"}, Destination: []string{"127.0.0.1:3000"}},
+				},
+			},
+		},
+	}
+
+	al, err := alias.Get("multi")
+	if err != nil {
+		t.Fatalf("error while reading the alias: %v", err)
+	}
+
+	if !reflect.DeepEqual(expected, al) {
+		t.Errorf("expected: %+v, actual: %+v", expected, al)
+	}
+}
+
+// No retries at all asks to never give up reconnecting, so only a number of
+// retries left out altogether takes the default.
+func TestGetMultiTunnelAliasKeepsZeroRetries(t *testing.T) {
+	writeAlias(t, "never-give-up", `connection-retries = 0
+
+[[tunnels]]
+server = "mole@bastion-a"
+
+  [[tunnels.forwards]]
+  type = "dynamic"
+`)
+
+	al, err := alias.Get("never-give-up")
+	if err != nil {
+		t.Fatalf("error while reading the alias: %v", err)
+	}
+
+	if al.ConnectionRetries != 0 {
+		t.Errorf("expected the alias to never give up reconnecting, but it gives up after %d retries", al.ConnectionRetries)
+	}
+}
+
+// An alias with tunnels, or without a server, is written by hand, where a
+// misspelled setting would otherwise be dropped without a word.
+func TestGetRejectsUnknownSettingsOfHandWrittenAliases(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		unknown string
+	}{
+		{
+			name:    "misspelled-tunnels",
+			content: "[[tunnel]]\nserver = \"mole@bastion-a\"\n",
+			unknown: "tunnel",
+		},
+		{
+			name:    "misspelled-setting",
+			content: "keep-alive = \"5s\"\n\n[[tunnels]]\nserver = \"mole@bastion-a\"\n\n  [[tunnels.forwards]]\n  type = \"dynamic\"\n",
+			unknown: "keep-alive",
+		},
+		{
+			name:    "misspelled-forwards",
+			content: "[[tunnels]]\nserver = \"mole@bastion-a\"\n\n  [[tunnels.forward]]\n  type = \"dynamic\"\n",
+			unknown: "tunnels.forward",
+		},
+	}
+
+	for _, test := range tests {
+		writeAlias(t, test.name, test.content)
+
+		_, err := alias.Get(test.name)
+		if err == nil || !strings.Contains(err.Error(), test.unknown) {
+			t.Errorf("expected reading alias %s to fail on the unknown setting %s, but got %v", test.name, test.unknown, err)
+		}
+	}
+}
+
+// An alias with a server of its own is the kind "mole add alias" writes, which
+// is read as it always was: whatever an older version wrote in it is left
+// alone, and nothing it leaves out is filled in.
+func TestGetLeavesFlatAliasesAlone(t *testing.T) {
+	writeAlias(t, "flat", "type = \"local\"\nserver = \"mole@bastion-a\"\nlocal = [\":8080\"]\n")
+
+	al, err := alias.Get("flat")
+	if err != nil {
+		t.Fatalf("error while reading the alias: %v", err)
+	}
+
+	if al.KeepAliveInterval != "" || al.ConnectionRetries != 0 || al.SshConfig != "" {
+		t.Errorf("expected the settings the alias leaves out to be left empty, but got %s", al)
+	}
+}
+
+func TestAddThenGetMultiTunnelAlias(t *testing.T) {
+	expected, err := alias.Get("multi")
+	if err != nil {
+		t.Fatalf("error while reading the alias: %v", err)
+	}
+
+	expected.Name = "multi-copy"
+
+	if err := alias.Add(expected); err != nil {
+		t.Fatalf("error while adding the alias: %v", err)
+	}
+	defer alias.Delete(expected.Name)
+
+	al, err := alias.Get(expected.Name)
+	if err != nil {
+		t.Fatalf("error while reading the alias back: %v", err)
+	}
+
+	if !reflect.DeepEqual(expected, al) {
+		t.Errorf("expected: %+v, actual: %+v", expected, al)
+	}
+}
+
+// writeAlias saves an alias file with the given content, which is removed once
+// the test is over so that it does not show up in what the other tests read.
+func writeAlias(t *testing.T, name, content string) {
+	t.Helper()
+
+	p := filepath.Join(home, ".mole", fmt.Sprintf("%s.toml", name))
+
+	if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+		t.Fatalf("error while writing alias %s: %v", name, err)
+	}
+
+	t.Cleanup(func() { os.Remove(p) })
 }

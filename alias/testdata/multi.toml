@@ -1,0 +1,28 @@
+verbose = true
+key = "path/to/key"
+timeout = "5s"
+rpc = true
+rpc-address = "127.0.0.1:0"
+
+[[tunnels]]
+server = "mole@bastion-a"
+
+  [[tunnels.forwards]]
+  type = "local"
+  source = [":8080"]
+  destination = ["db:5432"]
+
+  [[tunnels.forwards]]
+  type = "dynamic"
+  source = [":1080"]
+
+[[tunnels]]
+server = "mole@bastion-b:2222"
+key = "path/to/other/key"
+insecure = true
+connection-retries = 0
+
+  [[tunnels.forwards]]
+  type = "remote"
+  source = ["0.0.0.0:9000"]
+  destination = ["127.0.0.1:3000"]

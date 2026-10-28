@@ -12,15 +12,19 @@ import (
 )
 
 // Alias holds all attributes required to start a ssh port forwarding tunnel.
+//
+// An alias forwarding through several ssh servers has its Tunnels set instead
+// of the type, source, destination and server of a single tunnel. The other
+// tunnel settings are then the ones every tunnel takes unless it gives its own.
 type Alias struct {
 	Name              string   `toml:"name"`
-	TunnelType        string   `toml:"type"`
+	TunnelType        string   `toml:"type,omitempty"`
 	Verbose           bool     `toml:"verbose"`
 	Insecure          bool     `toml:"insecure"`
 	Detach            bool     `toml:"detach"`
-	Source            []string `toml:"source"`
-	Destination       []string `toml:"destination"`
-	Server            string   `toml:"server"`
+	Source            []string `toml:"source,omitempty"`
+	Destination       []string `toml:"destination,omitempty"`
+	Server            string   `toml:"server,omitempty"`
 	Key               string   `toml:"key"`
 	KeepAliveInterval string   `toml:"keep-alive-interval"`
 	ConnectionRetries int      `toml:"connection-retries"`
@@ -31,7 +35,44 @@ type Alias struct {
 	SocksAuth         string   `toml:"socks-auth"`
 	Rpc               bool     `toml:"rpc"`
 	RpcAddress        string   `toml:"rpc-address"`
+	Tunnels           []Tunnel `toml:"tunnels,omitempty"`
 }
+
+// Tunnel holds the attributes of one of the ssh servers an alias forwards
+// through. A setting left empty is taken from the alias, which is why the ones
+// whose zero value means something are pointers: no retries at all asks to
+// never give up reconnecting.
+type Tunnel struct {
+	Server            string    `toml:"server"`
+	Key               string    `toml:"key,omitempty"`
+	KeepAliveInterval string    `toml:"keep-alive-interval,omitempty"`
+	ConnectionRetries *int      `toml:"connection-retries,omitempty"`
+	WaitAndRetry      string    `toml:"wait-and-retry,omitempty"`
+	SshAgent          string    `toml:"ssh-agent,omitempty"`
+	Timeout           string    `toml:"timeout,omitempty"`
+	SshConfig         string    `toml:"config,omitempty"`
+	Insecure          *bool     `toml:"insecure,omitempty"`
+	SocksAuth         string    `toml:"socks-auth,omitempty"`
+	Forwards          []Forward `toml:"forwards"`
+}
+
+// Forward holds a group of channels of a single kind served through a tunnel.
+type Forward struct {
+	Type        string   `toml:"type"`
+	Source      []string `toml:"source,omitempty"`
+	Destination []string `toml:"destination,omitempty"`
+}
+
+// The values the tunnel settings of an alias forwarding through several ssh
+// servers take when the alias leaves them out, which are the ones the command
+// line defaults to.
+const (
+	DefaultKeepAliveInterval = "10s"
+	DefaultConnectionRetries = 3
+	DefaultWaitAndRetry      = "3s"
+	DefaultTimeout           = "3s"
+	DefaultSshConfig         = "$HOME/.ssh/config"
+)
 
 // String parses a Alias object to a string representation.
 func (a Alias) String() string {
@@ -172,12 +213,55 @@ func Get(aliasName string) (*Alias, error) {
 	}
 
 	a := &Alias{}
-	if _, err := toml.DecodeFile(p, a); err != nil {
+	md, err := toml.DecodeFile(p, a)
+	if err != nil {
 		return nil, err
 	}
 	a.Name = aliasName
 
+	// an alias with a server of its own is the kind "mole add alias" writes,
+	// which is read as it always was, whatever an older version wrote in it.
+	// One with tunnels, or with no server at all, is written by hand, where a
+	// misspelled setting would otherwise be dropped without a word, leaving an
+	// alias that does not do what it says.
+	if a.Server == "" || len(a.Tunnels) > 0 {
+		if keys := md.Undecoded(); len(keys) > 0 {
+			return nil, fmt.Errorf("alias %s has unknown settings: %v", aliasName, keys)
+		}
+	}
+
+	if len(a.Tunnels) > 0 {
+		a.applyDefaults(md)
+	}
+
 	return a, nil
+}
+
+// applyDefaults gives the tunnel settings an alias forwarding through several
+// ssh servers leaves out the values the command line defaults to, so that a
+// hand written alias only has to carry what sets it apart.
+func (a *Alias) applyDefaults(md toml.MetaData) {
+	if a.KeepAliveInterval == "" {
+		a.KeepAliveInterval = DefaultKeepAliveInterval
+	}
+
+	// no retries at all asks to never give up reconnecting, so only a number
+	// of retries left out altogether takes the default.
+	if !md.IsDefined("connection-retries") {
+		a.ConnectionRetries = DefaultConnectionRetries
+	}
+
+	if a.WaitAndRetry == "" {
+		a.WaitAndRetry = DefaultWaitAndRetry
+	}
+
+	if a.Timeout == "" {
+		a.Timeout = DefaultTimeout
+	}
+
+	if a.SshConfig == "" {
+		a.SshConfig = DefaultSshConfig
+	}
 }
 
 // FIXME terrible struct name. Change it.
