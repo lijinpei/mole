@@ -28,7 +28,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   environment variable carrying the credentials, so the password is neither
   given on the command line nor kept in the alias file, and it is left out of
   what an instance reports about itself
-
 - Aliases forwarding through several ssh servers at once, each with any mix of
   local, remote, dynamic and reverse dynamic forwards, written by hand as
   `[[tunnels]]` entries of the alias file. The settings at the top of the file

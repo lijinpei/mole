@@ -59,8 +59,9 @@ type Configuration struct {
 	RpcAddress string `json:"rpc-address" mapstructure:"rpc-address" toml:"rpc-address"`
 
 	// Tunnels holds the tunnels of an instance started from an alias
-	// forwarding through several ssh servers, which leaves the flat settings
-	// describing a single tunnel empty.
+	// forwarding through several ssh servers. The flat settings describing a
+	// single tunnel are not used then, and keep whatever they held, such as
+	// the defaults given on the command line.
 	Tunnels []TunnelConfiguration `json:"tunnels,omitempty" mapstructure:"tunnels" toml:"tunnels,omitempty"`
 }
 
@@ -175,6 +176,19 @@ func (c *Client) Start() error {
 		return err
 	}
 
+	// the tunnels are assigned before the rpc server starts, since it reads
+	// them from its own goroutine.
+	tunnels, err := createTunnels(c.Conf)
+	if err != nil {
+		log.WithFields(log.Fields{
+			"id": c.Conf.Id,
+		}).WithError(err).Error("error creating tunnel")
+
+		return err
+	}
+
+	c.Tunnels = tunnels
+
 	if c.Conf.Rpc {
 		addr, err := rpc.Start(c.Conf.RpcAddress)
 		if err != nil {
@@ -196,17 +210,6 @@ func (c *Client) Start() error {
 
 		log.Infof("rpc server address saved on %s", rd)
 	}
-
-	tunnels, err := createTunnels(c.Conf)
-	if err != nil {
-		log.WithFields(log.Fields{
-			"id": c.Conf.Id,
-		}).WithError(err).Error("error creating tunnel")
-
-		return err
-	}
-
-	c.Tunnels = tunnels
 
 	runners := make([]runner, len(tunnels))
 	for i, t := range tunnels {
