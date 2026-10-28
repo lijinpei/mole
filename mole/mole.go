@@ -57,6 +57,11 @@ type Configuration struct {
 	SocksAuth  string `json:"socks-auth" mapstructure:"socks-auth" toml:"socks-auth"`
 	Rpc        bool   `json:"rpc" mapstructure:"rpc" toml:"rpc"`
 	RpcAddress string `json:"rpc-address" mapstructure:"rpc-address" toml:"rpc-address"`
+
+	// Tunnels holds the tunnels of an instance started from an alias
+	// forwarding through several ssh servers, which leaves the flat settings
+	// describing a single tunnel empty.
+	Tunnels []TunnelConfiguration `json:"tunnels,omitempty" mapstructure:"tunnels" toml:"tunnels,omitempty"`
 }
 
 // ParseAlias translates a Configuration object to an Alias object.
@@ -288,6 +293,15 @@ func (c *Configuration) Merge(al *alias.Alias, givenFlags []string) error {
 	}
 
 	c.Id = al.Name
+
+	if len(al.Tunnels) > 0 {
+		return c.mergeTunnels(al, fl.lookup("insecure"))
+	}
+
+	if al.Server == "" {
+		return fmt.Errorf("alias %s has neither a server nor tunnels to forward through", al.Name)
+	}
+
 	c.TunnelType = al.TunnelType
 
 	srcl := AddressInputList{}
