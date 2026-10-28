@@ -29,6 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   given on the command line nor kept in the alias file, and it is left out of
   what an instance reports about itself
 
+- Aliases forwarding through several ssh servers at once, each with any mix of
+  local, remote, dynamic and reverse dynamic forwards, written by hand as
+  `[[tunnels]]` entries of the alias file. The settings at the top of the file
+  are used by every tunnel unless it gives its own, a tunnel that stops for
+  good leaves the others running, and `show instances` lists the forwards of
+  each tunnel
 ### Fixed
 - A tunnel that cannot listen on the endpoints it asks the ssh server for no
   longer gives up for good. The connection retries were only spent on reaching
@@ -98,6 +104,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Remove the `show logs` command. A detached instance writes its log to
   `$HOME/.mole/<instance-id>/mole.log`, which can be read with any tool;
   `tail -f` replaces `mole show logs --follow`
+- A destination address without a port no longer crashes `start`. The error
+  was logged but not returned, so mole went on to start a tunnel that did not
+  exist
 
 ## [2.0.0] - 2021-09-28
 ### Added

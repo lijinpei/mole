@@ -9,6 +9,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/davrodpin/mole/fsutils"
+	"github.com/davrodpin/mole/tunnel"
 )
 
 type Formatter interface {
@@ -75,6 +76,17 @@ func (c *Client) Runtime() (*Runtime, error) {
 	// no use for them.
 	runtime.SocksAuth = ""
 
+	if len(c.Conf.Tunnels) > 0 {
+		tunnels, err := c.tunnelsRuntime()
+		if err != nil {
+			return nil, err
+		}
+
+		runtime.Tunnels = tunnels
+
+		return &runtime, nil
+	}
+
 	// an instance with flat settings runs a single tunnel.
 	if len(c.Tunnels) > 0 {
 		source := &AddressInputList{}
@@ -108,6 +120,64 @@ func (c *Client) Runtime() (*Runtime, error) {
 	}
 
 	return &runtime, nil
+}
+
+// tunnelsRuntime returns what each tunnel of an instance forwarding through
+// several ssh servers is doing: the forwards it serves, with the source
+// endpoints its channels are listening on, and without the credentials its
+// socks proxies ask their clients for.
+func (c *Client) tunnelsRuntime() ([]TunnelConfiguration, error) {
+	// the tunnels are copied rather than changed in place: they are what the
+	// instance keeps running with.
+	tunnels := make([]TunnelConfiguration, len(c.Conf.Tunnels))
+
+	for i, tc := range c.Conf.Tunnels {
+		tc.SocksAuth = ""
+
+		// the tunnels only exist once the instance has started.
+		if i < len(c.Tunnels) {
+			forwards, err := forwardsOf(c.Tunnels[i].Channels())
+			if err != nil {
+				return nil, err
+			}
+
+			tc.Forwards = forwards
+		}
+
+		tunnels[i] = tc
+	}
+
+	return tunnels, nil
+}
+
+// forwardsOf returns the forwards the given channels serve, with the source
+// endpoints they are listening on. Channels of the same kind next to each other
+// are told about together, the way they were given.
+func forwardsOf(channels []*tunnel.SSHChannel) ([]ForwardConfiguration, error) {
+	var forwards []ForwardConfiguration
+
+	for _, channel := range channels {
+		if len(forwards) == 0 || forwards[len(forwards)-1].Type != channel.ChannelType {
+			forwards = append(forwards, ForwardConfiguration{Type: channel.ChannelType})
+		}
+
+		f := &forwards[len(forwards)-1]
+
+		if err := f.Source.Set(channel.Source); err != nil {
+			return nil, err
+		}
+
+		// a dynamic or reverse dynamic channel has no destination of its own.
+		if channel.Destination == "" {
+			continue
+		}
+
+		if err := f.Destination.Set(channel.Destination); err != nil {
+			return nil, err
+		}
+	}
+
+	return forwards, nil
 }
 
 // Running checks if an instance of mole is running on the system.

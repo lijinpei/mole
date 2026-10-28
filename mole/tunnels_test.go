@@ -1,6 +1,7 @@
 package mole
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -8,6 +9,8 @@ import (
 	"time"
 
 	"github.com/davrodpin/mole/alias"
+	"github.com/davrodpin/mole/tunnel"
+	"github.com/go-viper/mapstructure/v2"
 )
 
 func TestMergeTunnels(t *testing.T) {
@@ -452,4 +455,142 @@ func TestRunTunnelsReportsNothingWhenEveryTunnelStopsCleanly(t *testing.T) {
 	if err != nil {
 		t.Errorf("expected no error from tunnels that stopped cleanly, but got %v", err)
 	}
+}
+
+func TestRuntimeOfSeveralTunnels(t *testing.T) {
+	client := runtimeClient(t)
+
+	rt, err := client.Runtime()
+	if err != nil {
+		t.Fatalf("error while reading the runtime information: %v", err)
+	}
+
+	// the sources are the ones the channels are listening on, rather than the
+	// ones they were asked for, and the socks credentials are left out.
+	expected := []TunnelConfiguration{
+		{
+			Server:            address(t, "mole@bastion-a"),
+			KeepAliveInterval: 10 * time.Second,
+			Forwards: []ForwardConfiguration{
+				{Type: "local", Source: addresses(t, "127.0.0.1:8080"), Destination: addresses(t, "db:5432")},
+				{Type: "dynamic", Source: addresses(t, "127.0.0.1:1080")},
+			},
+		},
+		{
+			Server:   address(t, "mole@bastion-b:2222"),
+			Insecure: true,
+			Forwards: []ForwardConfiguration{
+				{Type: "remote", Source: addresses(t, "0.0.0.0:9000"), Destination: addresses(t, "127.0.0.1:3000")},
+			},
+		},
+	}
+
+	if !reflect.DeepEqual(expected, rt.Tunnels) {
+		t.Errorf("expected tunnels:\n%+v\nbut got:\n%+v", expected, rt.Tunnels)
+	}
+
+	// what the instance is running with is left alone: only what it reports is.
+	if client.Conf.Tunnels[0].SocksAuth != "mole:let me in" {
+		t.Errorf("the configuration of the instance lost its socks credentials")
+	}
+
+	if len(client.Conf.Tunnels[0].Forwards[0].Source) != 1 || client.Conf.Tunnels[0].Forwards[0].Source[0].Port != "0" {
+		t.Errorf("the configuration of the instance had its sources replaced: %+v", client.Conf.Tunnels[0].Forwards)
+	}
+}
+
+func TestRuntimeOfSeveralTunnelsToToml(t *testing.T) {
+	rt, err := runtimeClient(t).Runtime()
+	if err != nil {
+		t.Fatalf("error while reading the runtime information: %v", err)
+	}
+
+	out, err := rt.Format("toml")
+	if err != nil {
+		t.Fatalf("error while formatting the runtime information: %v", err)
+	}
+
+	for _, expected := range []string{"[[tunnels]]", "[[tunnels.forwards]]", `type = "dynamic"`, `host = "bastion-b"`} {
+		if !strings.Contains(out, expected) {
+			t.Errorf("expected the runtime information to carry %s, but got:\n%s", expected, out)
+		}
+	}
+
+	if strings.Contains(out, "let me in") {
+		t.Errorf("the runtime information carries the socks credentials:\n%s", out)
+	}
+}
+
+// "mole show instances" reads what an instance tells about itself through the
+// rpc server, which carries it as json, so the tunnels have to make it through.
+func TestRuntimeOfSeveralTunnelsThroughRpc(t *testing.T) {
+	rt, err := runtimeClient(t).Runtime()
+	if err != nil {
+		t.Fatalf("error while reading the runtime information: %v", err)
+	}
+
+	data, err := json.Marshal(rt)
+	if err != nil {
+		t.Fatalf("error while encoding the runtime information: %v", err)
+	}
+
+	var message interface{}
+	if err := json.Unmarshal(data, &message); err != nil {
+		t.Fatalf("error while decoding the rpc message: %v", err)
+	}
+
+	var received Runtime
+	if err := mapstructure.Decode(message, &received); err != nil {
+		t.Fatalf("error while reading the runtime information from the rpc message: %v", err)
+	}
+
+	if !reflect.DeepEqual(rt.Tunnels, received.Tunnels) {
+		t.Errorf("expected tunnels:\n%+v\nbut got:\n%+v", rt.Tunnels, received.Tunnels)
+	}
+}
+
+// runtimeClient returns a client forwarding through two ssh servers whose
+// tunnels are never started: the sources they were created with stand for the
+// ones they would be listening on, which differ from the configured ones.
+func runtimeClient(t *testing.T) *Client {
+	t.Helper()
+
+	conf := &Configuration{
+		Id: "multi",
+		Tunnels: []TunnelConfiguration{
+			{
+				Server:            address(t, "mole@bastion-a"),
+				KeepAliveInterval: 10 * time.Second,
+				SocksAuth:         "mole:let me in",
+				Forwards: []ForwardConfiguration{
+					{Type: "local", Source: addresses(t, "127.0.0.1:0"), Destination: addresses(t, "db:5432")},
+					{Type: "dynamic", Source: addresses(t, "127.0.0.1:0")},
+				},
+			},
+			{
+				Server:   address(t, "mole@bastion-b:2222"),
+				Insecure: true,
+				Forwards: []ForwardConfiguration{
+					{Type: "remote", Source: addresses(t, "0.0.0.0:0"), Destination: addresses(t, "127.0.0.1:3000")},
+				},
+			},
+		},
+	}
+
+	first, err := tunnel.NewWithForwards(&tunnel.Server{Name: "bastion-a"}, []tunnel.Forward{
+		{Type: "local", Source: []string{"127.0.0.1:8080"}, Destination: []string{"db:5432"}},
+		{Type: "dynamic", Source: []string{"127.0.0.1:1080"}},
+	}, "")
+	if err != nil {
+		t.Fatalf("error while creating the first tunnel: %v", err)
+	}
+
+	second, err := tunnel.NewWithForwards(&tunnel.Server{Name: "bastion-b"}, []tunnel.Forward{
+		{Type: "remote", Source: []string{"0.0.0.0:9000"}, Destination: []string{"127.0.0.1:3000"}},
+	}, "")
+	if err != nil {
+		t.Fatalf("error while creating the second tunnel: %v", err)
+	}
+
+	return &Client{Conf: conf, Tunnels: []*tunnel.Tunnel{first, second}}
 }

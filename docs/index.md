@@ -15,6 +15,7 @@ INFO[0000] tunnel channel is waiting for connection      destination="127.0.0.1:
   * [Auto address selection](#let-mole-to-randomly-select-the-source-endpoint): find a port available and start listening to it, so the `--source` flag doesn't need to be given every time you run the app.
   * [Create multiple tunnels using a single ssh connection](#create-multiple-tunnels-using-a-single-ssh-connection): multiple tunnels can be established using a single connection to a ssh server by specifying different `--destination` flags.
   * [Aliases](#create-an-alias-so-there-is-no-need-to-remember-the-tunnel-settings-afterwards): save your tunnel settings under an alias, so it can be reused later.
+  * [Aliases through several servers](#forward-through-several-ssh-servers-with-a-single-alias): a single alias can forward through several ssh servers at once, each with any mix of local, remote, dynamic and reverse dynamic forwards, started and stopped together.
   * [SOCKS5 proxy](#start-a-socks5-proxy-with-dynamic-port-forwarding): with `start dynamic` there is no `--destination` to be given, since each client asks for the address it wants to reach and the names are resolved by the jump server.
   * [Reverse SOCKS5 proxy](#expose-a-socks5-proxy-with-reverse-dynamic-port-forwarding): with `start reverse-dynamic` the proxy is served on an endpoint of the jump server instead, so whoever can reach that endpoint reaches every service this computer can, again without a `--destination` to be given.
   * Leverage the SSH Config File: use some options (e.g. user name, identity key and port), specified in *$HOME/.ssh/config* whenever possible, so there is no need to have the same SSH server configuration in multiple places.
@@ -44,6 +45,7 @@ INFO[0000] tunnel channel is waiting for connection      destination="127.0.0.1:
   * [Connect to a remote service that is running on 127.0.0.1 by specifying only the destination port](#connect-to-a-remote-service-that-is-running-on-127001-by-specifying-only-the-destination-port)
   * [Create an alias, so there is no need to remember the tunnel settings afterwards](#create-an-alias-so-there-is-no-need-to-remember-the-tunnel-settings-afterwards)
   * [Start mole in background](#start-mole-in-background)
+  * [Forward through several ssh servers with a single alias](#forward-through-several-ssh-servers-with-a-single-alias)
   * [Leveraging LocalForward from SSH configuration file](#leveraging-localforward-from-ssh-configuration-file)
   * [Leveraging RemoteForward from SSH configuration file](#leveraging-remoteforward-from-ssh-configuration-file)
   * [Start a SOCKS5 proxy with dynamic port forwarding](#start-a-socks5-proxy-with-dynamic-port-forwarding)
@@ -413,6 +415,52 @@ $ mole add alias local example \
 $ mole start alias example --detach
 INFO[0000] execute "mole stop example" if you like to stop it at any time
 ```
+
+### Forward through several ssh servers with a single alias
+
+An alias can forward through several ssh servers at once, each with any mix of
+local, remote, dynamic and reverse dynamic forwards. Such an alias is written by
+hand in `$HOME/.mole/<alias>.toml`: every `[[tunnels]]` entry is a connection to
+a ssh server, serving the `[[tunnels.forwards]]` listed under it.
+
+The settings at the top of the file are used by every tunnel, which can give
+its own `key`, `ssh-agent`, `config`, `insecure`, `timeout`,
+`keep-alive-interval`, `connection-retries`, `wait-and-retry` and `socks-auth`.
+`verbose`, `detach`, `rpc` and `rpc-address` are about the whole instance.
+
+```sh
+$ cat ~/.mole/example.toml
+key = "/home/user/.ssh/id_ed25519"
+connection-retries = 3
+
+[[tunnels]]
+server = "user@bastion-a.example.com"
+
+  [[tunnels.forwards]]
+  type = "local"
+  source = [":8080"]
+  destination = ["172.17.0.100:80"]
+
+  [[tunnels.forwards]]
+  type = "dynamic"
+  source = [":1080"]
+
+[[tunnels]]
+server = "user@bastion-b.example.com:2222"
+key = "/home/user/.ssh/other_key"
+
+  [[tunnels.forwards]]
+  type = "remote"
+  source = ["127.0.0.1:9000"]
+  destination = ["127.0.0.1:3000"]
+$ mole start alias example
+INFO[0000] tunnel channel is waiting for connection      destination="172.17.0.100:80" source="127.0.0.1:8080"
+INFO[0000] tunnel channel is waiting for connection      source="127.0.0.1:1080"
+INFO[0000] tunnel channel is waiting for connection      destination="127.0.0.1:3000" source="127.0.0.1:9000"
+```
+
+A tunnel that stops for good, e.g. after running out of connection retries, is
+reported and leaves the others running. `mole stop example` stops all of them.
 
 ### Leveraging LocalForward from SSH configuration file
 
