@@ -22,8 +22,8 @@ type Alias struct {
 	Verbose           bool     `toml:"verbose"`
 	Insecure          bool     `toml:"insecure"`
 	Detach            bool     `toml:"detach"`
-	Source            []string `toml:"source,omitempty"`
-	Destination       []string `toml:"destination,omitempty"`
+	Source            []string `toml:"source"`
+	Destination       []string `toml:"destination"`
 	Server            string   `toml:"server,omitempty"`
 	Key               string   `toml:"key"`
 	KeepAliveInterval string   `toml:"keep-alive-interval"`

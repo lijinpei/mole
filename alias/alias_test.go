@@ -365,3 +365,29 @@ func writeAlias(t *testing.T, name, content string) {
 
 	t.Cleanup(func() { os.Remove(p) })
 }
+
+// A flat alias is shown as it always was, which includes the empty lists a
+// dynamic alias or one reading its forwards from the ssh config carries.
+func TestShowKeepsEmptyListsOfFlatAliases(t *testing.T) {
+	a := &alias.Alias{
+		Name:        "flat-dynamic",
+		TunnelType:  "dynamic",
+		Source:      []string{":1080"},
+		Destination: []string{},
+		Server:      "server.com",
+	}
+
+	if err := alias.Add(a); err != nil {
+		t.Fatalf("error while adding the alias: %v", err)
+	}
+	defer alias.Delete(a.Name)
+
+	output, err := alias.Show(a.Name)
+	if err != nil {
+		t.Fatalf("error showing alias: %v", err)
+	}
+
+	if !strings.Contains(output, "destination = []") {
+		t.Errorf("expected the empty destination to be shown, but got:\n%s", output)
+	}
+}
