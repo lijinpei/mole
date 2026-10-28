@@ -27,6 +27,9 @@ const (
 	// for: the destination of each of its connections is asked for by the client
 	// that made it.
 	DestinationNotAllowed = "cannot create a %s tunnel with destination addresses"
+	// NoForwardGiven is the error given when a tunnel is created with nothing
+	// to forward.
+	NoForwardGiven = "cannot create a tunnel without at least one forward"
 )
 
 // Server holds the SSH Server attributes used for the client to connect to it.
@@ -302,8 +305,9 @@ func (ch *SSHChannel) String() string {
 // A Tunnel can only be started once: stopping it releases the source endpoints
 // of its channels and the connection to the ssh server for good.
 type Tunnel struct {
-	// Type tells what kind of port forwarding this tunnel will handle: local,
-	// remote, dynamic or reverse-dynamic
+	// Type tells what kind of port forwarding this tunnel handles: local,
+	// remote, dynamic or reverse-dynamic. It is empty for a tunnel whose
+	// channels are not all of the same kind, each of which tells its own.
 	Type string
 
 	// Ready tells when the Tunnel is ready to accept connections, which is as
@@ -380,36 +384,62 @@ func (c *serverConnection) disconnected() <-chan struct{} {
 	return c.gone
 }
 
-// New creates a new instance of Tunnel.
+// Forward is a group of channels of a single kind, given the same way the
+// channels of a tunnel of that kind are: a dynamic or reverse dynamic forward
+// takes no destination, and a forward with neither source nor destination
+// reads the ones of its kind from the ssh configuration file.
+type Forward struct {
+	Type        string
+	Source      []string
+	Destination []string
+}
+
+// New creates a new instance of Tunnel whose channels are all of the given
+// kind.
 func New(tunnelType string, server *Server, source, destination []string, config string) (*Tunnel, error) {
+	return NewWithForwards(server, []Forward{{Type: tunnelType, Source: source, Destination: destination}}, config)
+}
+
+// NewWithForwards creates a new instance of Tunnel serving the channels of
+// every given forward, whatever their kind, on a single connection to the ssh
+// server.
+func NewWithForwards(server *Server, forwards []Forward, config string) (*Tunnel, error) {
+	if len(forwards) == 0 {
+		return nil, fmt.Errorf(NoForwardGiven)
+	}
+
 	var channels []*SSHChannel
-	var err error
 
-	// the type is checked before anything is built from it so that a tunnel
-	// asked for by a name that does not exist, as an alias carrying a typo does,
-	// is told about it instead of failing on whatever the channels of an unknown
-	// type end up missing.
-	switch tunnelType {
-	case "local", "remote", "dynamic", "reverse-dynamic":
-	default:
-		return nil, fmt.Errorf("unsupported tunnel type %s", tunnelType)
-	}
-
-	channels, err = buildSSHChannels(server.Name, tunnelType, source, destination, config)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, channel := range channels {
-		// a dynamic or reverse dynamic channel has no destination of its own:
-		// every connection made to it carries the address it wants to reach.
-		if channel.Source == "" || (channel.Destination == "" && !socksChannel(channel.ChannelType)) {
-			return nil, fmt.Errorf("invalid ssh channel: source=%s, destination=%s", channel.Source, channel.Destination)
+	for _, forward := range forwards {
+		// the type is checked before anything is built from it so that a
+		// forward asked for by a name that does not exist, as an alias carrying
+		// a typo does, is told about it instead of failing on whatever the
+		// channels of an unknown type end up missing.
+		switch forward.Type {
+		case "local", "remote", "dynamic", "reverse-dynamic":
+		default:
+			return nil, fmt.Errorf("unsupported tunnel type %s", forward.Type)
 		}
+
+		chs, err := buildSSHChannels(server.Name, forward.Type, forward.Source, forward.Destination, config)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, channel := range chs {
+			// a dynamic or reverse dynamic channel has no destination of its
+			// own: every connection made to it carries the address it wants to
+			// reach.
+			if channel.Source == "" || (channel.Destination == "" && !socksChannel(channel.ChannelType)) {
+				return nil, fmt.Errorf("invalid ssh channel: source=%s, destination=%s", channel.Source, channel.Destination)
+			}
+		}
+
+		channels = append(channels, chs...)
 	}
 
 	t := &Tunnel{
-		Type:     tunnelType,
+		Type:     sharedType(forwards),
 		Ready:    make(chan bool, 1),
 		channels: channels,
 		server:   server,
@@ -418,6 +448,18 @@ func New(tunnelType string, server *Server, source, destination []string, config
 	}
 
 	return t, nil
+}
+
+// sharedType returns the kind shared by every given forward, which is empty
+// when they are not all of the same kind.
+func sharedType(forwards []Forward) string {
+	for _, forward := range forwards[1:] {
+		if forward.Type != forwards[0].Type {
+			return ""
+		}
+	}
+
+	return forwards[0].Type
 }
 
 // sshClient returns the connection to the ssh server currently in use, which
@@ -560,6 +602,22 @@ func (t *Tunnel) reconnectionDisabled() bool {
 	return t.ConnectionRetries < 0
 }
 
+// listenError tells which channel could not listen on its source endpoint,
+// since whether asking for it again can fix it depends on where that endpoint
+// lives.
+type listenError struct {
+	channel *SSHChannel
+	err     error
+}
+
+func (e *listenError) Error() string {
+	return e.err.Error()
+}
+
+func (e *listenError) Unwrap() error {
+	return e.err
+}
+
 // Listen creates the listeners the tunnel channels are missing and starts
 // serving the connections made to them.
 //
@@ -574,7 +632,7 @@ func (t *Tunnel) Listen() error {
 	for _, ch := range t.channels {
 		listener, err := ch.Listen(conn.sshClient())
 		if err != nil {
-			return err
+			return &listenError{channel: ch, err: err}
 		}
 
 		if listener == nil {
@@ -637,7 +695,7 @@ func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn, disconnected <
 		"channel": channel,
 	}).Debug("connection established")
 
-	switch t.Type {
+	switch channel.ChannelType {
 	case "dynamic":
 		// the destination is not known yet: the socks server reads it from the
 		// connection itself and reaches it from the ssh server.
@@ -675,7 +733,7 @@ func (t *Tunnel) startChannel(channel *SSHChannel, conn net.Conn, disconnected <
 	case "remote":
 		destinationConn, err = net.Dial("tcp", channel.Destination)
 	default:
-		return fmt.Errorf("unknown tunnel type %s", t.Type)
+		return fmt.Errorf("unknown channel type %s", channel.ChannelType)
 	}
 
 	if err != nil {
@@ -918,7 +976,8 @@ func (t *Tunnel) connect() error {
 			// listens on may still be held by the connection that just died and
 			// is given up in a moment, so it is asked for again the same way the
 			// connection to the server is.
-			if !serverListener(t.Type) {
+			var le *listenError
+			if errors.As(err, &le) && !serverListener(le.channel.ChannelType) {
 				return err
 			}
 		}
