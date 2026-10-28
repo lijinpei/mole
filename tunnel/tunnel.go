@@ -411,14 +411,8 @@ func NewWithForwards(server *Server, forwards []Forward, config string) (*Tunnel
 	var channels []*SSHChannel
 
 	for _, forward := range forwards {
-		// the type is checked before anything is built from it so that a
-		// forward asked for by a name that does not exist, as an alias carrying
-		// a typo does, is told about it instead of failing on whatever the
-		// channels of an unknown type end up missing.
-		switch forward.Type {
-		case "local", "remote", "dynamic", "reverse-dynamic":
-		default:
-			return nil, fmt.Errorf("unsupported tunnel type %s", forward.Type)
+		if err := CheckForward(forward); err != nil {
+			return nil, err
 		}
 
 		chs, err := buildSSHChannels(server.Name, forward.Type, forward.Source, forward.Destination, config)
@@ -448,6 +442,25 @@ func NewWithForwards(server *Server, forwards []Forward, config string) (*Tunnel
 	}
 
 	return t, nil
+}
+
+// CheckForward reports why a forward cannot be served, which lets whoever
+// builds one find out before anything is started. The type is checked before
+// anything is built from it so that a forward asked for by a name that does not
+// exist, as an alias carrying a typo does, is told about it instead of failing
+// on whatever the channels of an unknown type end up missing.
+func CheckForward(forward Forward) error {
+	switch forward.Type {
+	case "local", "remote":
+	case "dynamic", "reverse-dynamic":
+		if len(forward.Destination) > 0 {
+			return fmt.Errorf(DestinationNotAllowed, forward.Type)
+		}
+	default:
+		return fmt.Errorf("unsupported tunnel type %s", forward.Type)
+	}
+
+	return nil
 }
 
 // sharedType returns the kind shared by every given forward, which is empty

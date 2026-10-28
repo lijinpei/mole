@@ -474,7 +474,7 @@ func createTunnels(conf *Configuration) ([]*tunnel.Tunnel, error) {
 	for _, tc := range conf.tunnels() {
 		t, err := createTunnel(tc)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("tunnel %s: %w", tc.Server.String(), err)
 		}
 
 		tunnels = append(tunnels, t)
@@ -513,19 +513,13 @@ func createTunnel(tc TunnelConfiguration) (*tunnel.Tunnel, error) {
 	forwards := make([]tunnel.Forward, len(tc.Forwards))
 
 	for i, f := range tc.Forwards {
-		destination := make([]string, len(f.Destination))
+		var err error
 
-		for j, r := range f.Destination {
-			if r.Port == "" {
-				err := fmt.Errorf("missing port in destination address: %s", r.String())
-				log.Error(err)
-				return nil, err
-			}
-
-			destination[j] = r.String()
+		forwards[i], err = f.forward()
+		if err != nil {
+			log.Error(err)
+			return nil, err
 		}
-
-		forwards[i] = tunnel.Forward{Type: f.Type, Source: f.Source.List(), Destination: destination}
 	}
 
 	t, err := tunnel.NewWithForwards(s, forwards, tc.SshConfig)

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/davrodpin/mole/alias"
+	"github.com/davrodpin/mole/tunnel"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -32,6 +33,22 @@ type ForwardConfiguration struct {
 	Type        string           `json:"type" mapstructure:"type" toml:"type"`
 	Source      AddressInputList `json:"source" mapstructure:"source" toml:"source"`
 	Destination AddressInputList `json:"destination" mapstructure:"destination" toml:"destination"`
+}
+
+// forward converts the configuration to what a tunnel serves, which needs every
+// destination to carry the port to reach.
+func (f ForwardConfiguration) forward() (tunnel.Forward, error) {
+	destination := make([]string, len(f.Destination))
+
+	for i, r := range f.Destination {
+		if r.Port == "" {
+			return tunnel.Forward{}, fmt.Errorf("missing port in destination address: %s", r.String())
+		}
+
+		destination[i] = r.String()
+	}
+
+	return tunnel.Forward{Type: f.Type, Source: f.Source.List(), Destination: destination}, nil
 }
 
 // mergeTunnels overwrites the Configuration from an alias forwarding through
@@ -133,6 +150,17 @@ func mergeTunnel(al *alias.Alias, at alias.Tunnel) (*TunnelConfiguration, error)
 			if err := f.Destination.Set(dst); err != nil {
 				return nil, err
 			}
+		}
+
+		// what createTunnels would refuse is refused here as well, since it runs
+		// once a detached instance has already told its parent that it started.
+		tf, err := f.forward()
+		if err != nil {
+			return nil, fmt.Errorf("%v for server %s", err, at.Server)
+		}
+
+		if err := tunnel.CheckForward(tf); err != nil {
+			return nil, fmt.Errorf("%v for server %s", err, at.Server)
 		}
 
 		tc.Forwards = append(tc.Forwards, f)

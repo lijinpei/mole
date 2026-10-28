@@ -121,6 +121,12 @@ func TestMergeTunnelsRejectsInvalidAliases(t *testing.T) {
 		{"a tunnel without server", func(al *alias.Alias) { al.Tunnels[1].Server = "" }},
 		{"a tunnel without forwards", func(al *alias.Alias) { al.Tunnels[1].Forwards = nil }},
 		{"a forward without type", func(al *alias.Alias) { al.Tunnels[0].Forwards[1].Type = "" }},
+		{"an unknown kind", func(al *alias.Alias) { al.Tunnels[0].Forwards[1].Type = "locla" }},
+		{"a destination given to a dynamic forward", func(al *alias.Alias) {
+			al.Tunnels[0].Forwards[1].Type = "dynamic"
+			al.Tunnels[0].Forwards[1].Destination = []string{"db:5432"}
+		}},
+		{"a destination without port", func(al *alias.Alias) { al.Tunnels[0].Forwards[0].Destination = []string{"db"} }},
 		{"an invalid duration", func(al *alias.Alias) { al.Tunnels[1].Timeout = "soon" }},
 	}
 
