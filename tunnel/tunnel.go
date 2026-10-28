@@ -567,7 +567,7 @@ func (t *Tunnel) serve() {
 		if t.reconnectionDisabled() {
 			err := fmt.Errorf("connection to the ssh server is gone and reconnection is disabled: %v", conn.err)
 
-			log.WithError(conn.err).Error("connection to the ssh server is gone and reconnection is disabled")
+			log.WithError(conn.err).WithFields(log.Fields{"server": t.server}).Error("connection to the ssh server is gone and reconnection is disabled")
 
 			if !t.stopping() {
 				t.done <- err
@@ -576,7 +576,7 @@ func (t *Tunnel) serve() {
 			return
 		}
 
-		log.WithError(conn.err).Warnf("reconnecting to ssh server")
+		log.WithError(conn.err).WithFields(log.Fields{"server": t.server}).Warn("reconnecting to ssh server")
 		log.Debugf("restablishing the tunnel after disconnection: %s", t)
 	}
 }
@@ -652,7 +652,7 @@ func (t *Tunnel) Listen() error {
 			continue
 		}
 
-		fields := log.Fields{"source": ch.source()}
+		fields := log.Fields{"server": t.server, "source": ch.source()}
 
 		// a dynamic or reverse dynamic channel has no destination to tell about:
 		// every connection made to it carries the address it wants to reach.
@@ -1065,6 +1065,7 @@ func (t *Tunnel) stopServing(channel *SSHChannel, err error) {
 		// connection it was created on, and a new one is created, and served, as
 		// soon as the tunnel connects to the server again.
 		log.WithError(err).WithFields(log.Fields{
+			"server":  t.server,
 			"channel": channel,
 		}).Warn("tunnel channel stopped accepting connections until the tunnel reconnects to the ssh server")
 
@@ -1104,7 +1105,7 @@ func (t *Tunnel) keepAlive(conn *serverConnection) {
 		case <-ticker.C:
 			_, _, err := conn.client.SendRequest("keepalive@mole", true, nil)
 			if err != nil {
-				log.Warnf("error sending keep-alive request to ssh server: %v", err)
+				log.WithError(err).WithFields(log.Fields{"server": t.server}).Warn("error sending keep-alive request to ssh server")
 			}
 		case <-conn.gone:
 			log.Debug("stop sending keep alive packets")
