@@ -1,10 +1,13 @@
 package mole
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/davrodpin/mole/alias"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // TunnelConfiguration holds what it takes to forward through one of the ssh
@@ -146,4 +149,71 @@ func inherit(own, fallback string) string {
 	}
 
 	return fallback
+}
+
+// tunnels returns the configuration of every tunnel the instance runs: the ones
+// of an alias forwarding through several ssh servers, or else the single one
+// the flat settings describe.
+func (c *Configuration) tunnels() []TunnelConfiguration {
+	if len(c.Tunnels) > 0 {
+		return c.Tunnels
+	}
+
+	return []TunnelConfiguration{{
+		Server:            c.Server,
+		Key:               c.Key,
+		KeepAliveInterval: c.KeepAliveInterval,
+		ConnectionRetries: c.ConnectionRetries,
+		WaitAndRetry:      c.WaitAndRetry,
+		SshAgent:          c.SshAgent,
+		Timeout:           c.Timeout,
+		SshConfig:         c.SshConfig,
+		Insecure:          c.Insecure,
+		SocksAuth:         c.SocksAuth,
+		Forwards: []ForwardConfiguration{{
+			Type:        c.TunnelType,
+			Source:      c.Source,
+			Destination: c.Destination,
+		}},
+	}}
+}
+
+// runner is what runTunnels needs from a tunnel, which keeps how an instance
+// runs several of them testable without a ssh server.
+type runner interface {
+	Start() error
+	String() string
+}
+
+// runTunnels starts every given tunnel and waits for all of them to be over. A
+// tunnel ending for good is reported along with what it was forwarding
+// through, while the others keep going: an alias forwarding through several
+// ssh servers is still of use for as long as any of them is.
+func runTunnels(tunnels []runner) error {
+	results := make(chan error, len(tunnels))
+
+	for _, t := range tunnels {
+		go func(t runner) {
+			err := t.Start()
+			if err != nil {
+				log.WithFields(log.Fields{
+					"tunnel": t.String(),
+				}).WithError(err).Error("error while starting tunnel")
+
+				err = fmt.Errorf("tunnel %s: %w", t, err)
+			}
+
+			results <- err
+		}(t)
+	}
+
+	var errs []error
+
+	for range tunnels {
+		if err := <-results; err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	return errors.Join(errs...)
 }

@@ -75,11 +75,12 @@ func (c *Client) Runtime() (*Runtime, error) {
 	// no use for them.
 	runtime.SocksAuth = ""
 
-	if c.Tunnel != nil {
+	// an instance with flat settings runs a single tunnel.
+	if len(c.Tunnels) > 0 {
 		source := &AddressInputList{}
 		destination := &AddressInputList{}
 
-		for _, channel := range c.Tunnel.Channels() {
+		for _, channel := range c.Tunnels[0].Channels() {
 			var err error
 
 			err = source.Set(channel.Source)

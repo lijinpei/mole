@@ -112,7 +112,7 @@ func TestRuntimeOfDynamicTunnel(t *testing.T) {
 			t.Fatalf("error while creating the %s tunnel: %v", tunnelType, err)
 		}
 
-		client := mole.Client{Conf: &mole.Configuration{Id: "dynamic-runtime"}, Tunnel: tun}
+		client := mole.Client{Conf: &mole.Configuration{Id: "dynamic-runtime"}, Tunnels: []*tunnel.Tunnel{tun}}
 
 		rt, err := client.Runtime()
 		if err != nil {

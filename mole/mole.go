@@ -90,9 +90,11 @@ func (c Configuration) ParseAlias(name string) *alias.Alias {
 
 // Client manages the overall state of the application based on its configuration.
 type Client struct {
-	Conf   *Configuration
-	Tunnel *tunnel.Tunnel
-	sigs   chan os.Signal
+	Conf *Configuration
+	// Tunnels holds a tunnel for each ssh server the instance forwards
+	// through, in the order they are configured.
+	Tunnels []*tunnel.Tunnel
+	sigs    chan os.Signal
 }
 
 // New initializes a new mole's client.
@@ -195,7 +197,7 @@ func (c *Client) Start() error {
 		log.Infof("rpc server address saved on %s", rd)
 	}
 
-	t, err := createTunnel(c.Conf)
+	tunnels, err := createTunnels(c.Conf)
 	if err != nil {
 		log.WithFields(log.Fields{
 			"id": c.Conf.Id,
@@ -204,17 +206,14 @@ func (c *Client) Start() error {
 		return err
 	}
 
-	c.Tunnel = t
+	c.Tunnels = tunnels
 
-	if err = c.Tunnel.Start(); err != nil {
-		log.WithFields(log.Fields{
-			"tunnel": c.Tunnel.String(),
-		}).WithError(err).Error("error while starting tunnel")
-
-		return err
+	runners := make([]runner, len(tunnels))
+	for i, t := range tunnels {
+		runners[i] = t
 	}
 
-	return nil
+	return runTunnels(runners)
 }
 
 // Stop shuts down a detached mole's application instance.
@@ -466,18 +465,38 @@ func (fs flags) lookup(flag string) bool {
 	return false
 }
 
-func createTunnel(conf *Configuration) (*tunnel.Tunnel, error) {
-	s, err := tunnel.NewServer(conf.Server.User, conf.Server.Address(), conf.Key, conf.SshAgent, conf.SshConfig)
+// createTunnels creates every tunnel the instance runs, one after the other so
+// that the passphrase of a key is never asked for while another one is. Any of
+// them failing stops the instance before anything connects.
+func createTunnels(conf *Configuration) ([]*tunnel.Tunnel, error) {
+	var tunnels []*tunnel.Tunnel
+
+	for _, tc := range conf.tunnels() {
+		t, err := createTunnel(tc)
+		if err != nil {
+			return nil, err
+		}
+
+		tunnels = append(tunnels, t)
+	}
+
+	return tunnels, nil
+}
+
+func createTunnel(tc TunnelConfiguration) (*tunnel.Tunnel, error) {
+	s, err := tunnel.NewServer(tc.Server.User, tc.Server.Address(), tc.Key, tc.SshAgent, tc.SshConfig)
 	if err != nil {
 		log.Errorf("error processing server options: %v\n", err)
 		return nil, err
 	}
 
-	s.Insecure = conf.Insecure
-	s.Timeout = conf.Timeout
+	s.Insecure = tc.Insecure
+	s.Timeout = tc.Timeout
 
 	err = s.Key.HandlePassphrase(func() ([]byte, error) {
-		fmt.Printf("The key provided is secured by a password. Please provide it below:\n")
+		// an instance can connect to several servers, so the one the key is
+		// for is named.
+		fmt.Printf("The key provided for %s is secured by a password. Please provide it below:\n", tc.Server.String())
 		fmt.Printf("Password: ")
 		p, err := term.ReadPassword(int(syscall.Stdin))
 		fmt.Printf("\n")
@@ -491,28 +510,31 @@ func createTunnel(conf *Configuration) (*tunnel.Tunnel, error) {
 
 	log.Debugf("server: %s", s)
 
-	source := make([]string, len(conf.Source))
-	for i, r := range conf.Source {
-		source[i] = r.String()
-	}
+	forwards := make([]tunnel.Forward, len(tc.Forwards))
 
-	destination := make([]string, len(conf.Destination))
-	for i, r := range conf.Destination {
-		if r.Port == "" {
-			log.WithError(err).Errorf("missing port in destination address: %s", r.String())
-			return nil, err
+	for i, f := range tc.Forwards {
+		destination := make([]string, len(f.Destination))
+
+		for j, r := range f.Destination {
+			if r.Port == "" {
+				err := fmt.Errorf("missing port in destination address: %s", r.String())
+				log.Error(err)
+				return nil, err
+			}
+
+			destination[j] = r.String()
 		}
 
-		destination[i] = r.String()
+		forwards[i] = tunnel.Forward{Type: f.Type, Source: f.Source.List(), Destination: destination}
 	}
 
-	t, err := tunnel.New(conf.TunnelType, s, source, destination, conf.SshConfig)
+	t, err := tunnel.NewWithForwards(s, forwards, tc.SshConfig)
 	if err != nil {
 		log.Error(err)
 		return nil, err
 	}
 
-	t.SocksUser, t.SocksPassword, err = socksCredentials(conf.SocksAuth)
+	t.SocksUser, t.SocksPassword, err = socksCredentials(tc.SocksAuth)
 	if err != nil {
 		log.Error(err)
 		return nil, err
@@ -523,9 +545,9 @@ func createTunnel(conf *Configuration) (*tunnel.Tunnel, error) {
 	// set and CLI parsing is the one setting the default values).
 	// That could be done by make them required in the constructor's signature or
 	// by creating a configuration struct for a tunnel object.
-	t.ConnectionRetries = conf.ConnectionRetries
-	t.WaitAndRetry = conf.WaitAndRetry
-	t.KeepAliveInterval = conf.KeepAliveInterval
+	t.ConnectionRetries = tc.ConnectionRetries
+	t.WaitAndRetry = tc.WaitAndRetry
+	t.KeepAliveInterval = tc.KeepAliveInterval
 
 	return t, nil
 }
