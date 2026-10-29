@@ -2,8 +2,8 @@ package cmd
 
 import (
 	"os"
-	"time"
 
+	"github.com/davrodpin/mole/alias"
 	"github.com/davrodpin/mole/mole"
 
 	log "github.com/sirupsen/logrus"
@@ -40,11 +40,11 @@ multiple -source conf can be provided`)
 multiple -destination conf can be provided`)
 	cmd.Flags().VarP(&conf.Server, "server", "s", "set server address: [<user>@]<host>[:<port>]")
 	cmd.Flags().StringVarP(&conf.Key, "key", "k", "", "set server authentication key file path")
-	cmd.Flags().DurationVarP(&conf.KeepAliveInterval, "keep-alive-interval", "K", 10*time.Second, "time interval for keep alive packets to be sent")
-	cmd.Flags().IntVarP(&conf.ConnectionRetries, "connection-retries", "R", 3, `maximum number of connection retries to the ssh server
+	cmd.Flags().DurationVarP(&conf.KeepAliveInterval, "keep-alive-interval", "K", alias.DefaultKeepAliveInterval, "time interval for keep alive packets to be sent")
+	cmd.Flags().IntVarP(&conf.ConnectionRetries, "connection-retries", "R", alias.DefaultConnectionRetries, `maximum number of connection retries to the ssh server
 provide 0 to never give up or a negative number to disable`)
-	cmd.Flags().StringVarP(&conf.SshConfig, "config", "c", "$HOME/.ssh/config", "set config file path")
-	cmd.Flags().DurationVarP(&conf.WaitAndRetry, "retry-wait", "w", 3*time.Second, "time to wait before trying to reconnect to ssh server")
+	cmd.Flags().StringVarP(&conf.SshConfig, "config", "c", alias.DefaultSshConfig, "set config file path")
+	cmd.Flags().DurationVarP(&conf.WaitAndRetry, "retry-wait", "w", alias.DefaultWaitAndRetry, "time to wait before trying to reconnect to ssh server")
 	cmd.Flags().StringVarP(&conf.SshAgent, "ssh-agent", "A", "", `unix socket to communicate with a ssh agent, or named pipe
 on windows (e.g. \\.\pipe\openssh-ssh-agent)`)
 	cmd.Flags().StringVarP(&conf.SocksAuth, "socks-auth", "", "", `require the clients of the socks5 proxy served by a dynamic
@@ -53,7 +53,7 @@ or a reverse dynamic tunnel to authenticate with the given
 environment variable carrying it, so that the password is
 neither given on the command line nor kept in the alias file.
 The proxy serves whoever reaches it when nothing is given.`)
-	cmd.Flags().DurationVarP(&conf.Timeout, "timeout", "t", 3*time.Second, "ssh server connection timeout")
+	cmd.Flags().DurationVarP(&conf.Timeout, "timeout", "t", alias.DefaultTimeout, "ssh server connection timeout")
 	cmd.Flags().BoolVarP(&conf.Rpc, "rpc", "", false, "enable the rpc server")
 	cmd.Flags().StringVarP(&conf.RpcAddress, "rpc-address", "", "127.0.0.1:0", `set the network address of the rpc server.
 The default value uses a random free port to listen for requests.

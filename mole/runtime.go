@@ -76,62 +76,35 @@ func (c *Client) Runtime() (*Runtime, error) {
 	// no use for them.
 	runtime.SocksAuth = ""
 
-	if len(c.Conf.Tunnels) > 0 {
-		tunnels, err := c.tunnelsRuntime()
-		if err != nil {
-			return nil, err
-		}
-
-		runtime.Tunnels = tunnels
-
-		return &runtime, nil
+	tunnels, err := c.tunnelsRuntime()
+	if err != nil {
+		return nil, err
 	}
 
-	// an instance with flat settings runs a single tunnel.
-	if len(c.Tunnels) > 0 {
-		source := &AddressInputList{}
-		destination := &AddressInputList{}
-
-		for _, channel := range c.Tunnels[0].Channels() {
-			var err error
-
-			err = source.Set(channel.Source)
-			if err != nil {
-				return nil, err
-			}
-
-			// a dynamic or reverse dynamic channel has no destination of its
-			// own: every connection made to it carries the address it wants to
-			// reach, so there is nothing to report other than the endpoint it
-			// listens on.
-			if channel.Destination == "" {
-				continue
-			}
-
-			err = destination.Set(channel.Destination)
-			if err != nil {
-				return nil, err
-			}
-
+	if len(c.Conf.Tunnels) > 0 {
+		runtime.Tunnels = tunnels
+	} else if len(c.Tunnels) > 0 {
+		// flat output keeps its shape, but uses the same live interpretation.
+		runtime.Source = AddressInputList{}
+		runtime.Destination = AddressInputList{}
+		for _, forward := range tunnels[0].Forwards {
+			runtime.Source = append(runtime.Source, forward.Source...)
+			runtime.Destination = append(runtime.Destination, forward.Destination...)
 		}
-
-		runtime.Source = *source
-		runtime.Destination = *destination
 	}
 
 	return &runtime, nil
 }
 
-// tunnelsRuntime returns what each tunnel of an instance forwarding through
-// several ssh servers is doing: the forwards it serves, with the source
-// endpoints its channels are listening on, and without the credentials its
-// socks proxies ask their clients for.
+// tunnelsRuntime reports each tunnel's forwards with bound source endpoints
+// and without SOCKS credentials, regardless of the alias format.
 func (c *Client) tunnelsRuntime() ([]TunnelConfiguration, error) {
 	// the tunnels are copied rather than changed in place: they are what the
 	// instance keeps running with.
-	tunnels := make([]TunnelConfiguration, len(c.Conf.Tunnels))
+	configured := c.Conf.tunnels()
+	tunnels := make([]TunnelConfiguration, len(configured))
 
-	for i, tc := range c.Conf.Tunnels {
+	for i, tc := range configured {
 		tc.SocksAuth = ""
 
 		// the tunnels only exist once the instance has started.

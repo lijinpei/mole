@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/davrodpin/mole/fsutils"
@@ -67,10 +68,10 @@ type Forward struct {
 // servers take when the alias leaves them out, which are the ones the command
 // line defaults to.
 const (
-	DefaultKeepAliveInterval = "10s"
+	DefaultKeepAliveInterval = 10 * time.Second
 	DefaultConnectionRetries = 3
-	DefaultWaitAndRetry      = "3s"
-	DefaultTimeout           = "3s"
+	DefaultWaitAndRetry      = 3 * time.Second
+	DefaultTimeout           = 3 * time.Second
 	DefaultSshConfig         = "$HOME/.ssh/config"
 )
 
@@ -242,7 +243,7 @@ func Get(aliasName string) (*Alias, error) {
 // hand written alias only has to carry what sets it apart.
 func (a *Alias) applyDefaults(md toml.MetaData) {
 	if a.KeepAliveInterval == "" {
-		a.KeepAliveInterval = DefaultKeepAliveInterval
+		a.KeepAliveInterval = DefaultKeepAliveInterval.String()
 	}
 
 	// no retries at all asks to never give up reconnecting, so only a number
@@ -252,11 +253,11 @@ func (a *Alias) applyDefaults(md toml.MetaData) {
 	}
 
 	if a.WaitAndRetry == "" {
-		a.WaitAndRetry = DefaultWaitAndRetry
+		a.WaitAndRetry = DefaultWaitAndRetry.String()
 	}
 
 	if a.Timeout == "" {
-		a.Timeout = DefaultTimeout
+		a.Timeout = DefaultTimeout.String()
 	}
 
 	if a.SshConfig == "" {

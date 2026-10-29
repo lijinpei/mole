@@ -453,6 +453,9 @@ func NewWithForwards(server *Server, forwards []Forward, config string) (*Tunnel
 func CheckForward(forward Forward) error {
 	switch forward.Type {
 	case "local", "remote":
+		if len(forward.Source) > 0 && len(forward.Destination) == 0 {
+			return fmt.Errorf(NoDestinationGiven)
+		}
 	case "dynamic", "reverse-dynamic":
 		if len(forward.Destination) > 0 {
 			return fmt.Errorf(DestinationNotAllowed, forward.Type)

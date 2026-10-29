@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   good leaves the others running, and `show instances` lists the forwards of
   each tunnel
 ### Fixed
+- Flat aliases reject invalid forwards before detaching, just as multi-tunnel
+  aliases do. Local and remote forwards with a source but no destination are
+  also rejected before either alias format starts
 - A tunnel that cannot listen on the endpoints it asks the ssh server for no
   longer gives up for good. The connection retries were only spent on reaching
   the server, so a tunnel reconnecting to a server that had not released the
@@ -110,6 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`\\.\pipe\openssh-ssh-agent`) rather than on a unix socket
 
 ### Changed
+- `alias.DefaultKeepAliveInterval`, `alias.DefaultWaitAndRetry` and
+  `alias.DefaultTimeout` are now `time.Duration` constants shared by CLI and
+  alias defaults; callers needing their string values use `.String()`
 - CI runs the build and the test suite on windows as well as linux
 - The ssh server used by the test suite serves the endpoints it is asked to
   forward instead of replying with a port it never listens on, which is what a

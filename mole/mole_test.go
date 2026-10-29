@@ -99,8 +99,11 @@ func TestAliasMerge(t *testing.T) {
 	}
 
 	for id, test := range tests {
+		test.alias.TunnelType = "local"
 		conf := test.conf
-		conf.Merge(test.alias, test.givenFlags)
+		if err := conf.Merge(test.alias, test.givenFlags); err != nil {
+			t.Fatalf("could not merge alias on test %d: %v", id, err)
+		}
 
 		if test.expected.Verbose != conf.Verbose {
 			t.Errorf("verbose doesn't match on test %d: expected: %t, value: %t", id, test.expected.Verbose, conf.Verbose)

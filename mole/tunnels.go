@@ -51,32 +51,82 @@ func (f ForwardConfiguration) forward() (tunnel.Forward, error) {
 	return tunnel.Forward{Type: f.Type, Source: f.Source.List(), Destination: destination}, nil
 }
 
-// mergeTunnels overwrites the Configuration from an alias forwarding through
-// several ssh servers. Each tunnel takes the settings it leaves out from the
-// alias, and the insecure flag given on the command line, if any, over both.
-func (c *Configuration) mergeTunnels(al *alias.Alias, insecureGiven bool) error {
-	// the flat settings describe a tunnel of their own, which would have to be
-	// either dropped without a word or started along with the others.
-	if al.Server != "" || al.TunnelType != "" || len(al.Source) > 0 || len(al.Destination) > 0 {
-		return fmt.Errorf("alias %s has tunnels along with a server, type, source or destination of its own: move them into a tunnel", al.Name)
+type flags []string
+
+func (fs flags) lookup(flag string) bool {
+	for _, f := range fs {
+		if flag == f {
+			return true
+		}
 	}
 
-	tunnels := make([]TunnelConfiguration, len(al.Tunnels))
+	return false
+}
 
-	for i, at := range al.Tunnels {
+// Merge overwrites Configuration from the given Alias. Verbose, Insecure and
+// Detach flags named in givenFlags take precedence over the alias settings.
+func (c *Configuration) Merge(al *alias.Alias, givenFlags []string) error {
+	var fl flags = givenFlags
+
+	if !fl.lookup("verbose") {
+		c.Verbose = al.Verbose
+	}
+	if !fl.lookup("insecure") {
+		c.Insecure = al.Insecure
+	}
+	if !fl.lookup("detach") {
+		c.Detach = al.Detach
+	}
+	c.Id = al.Name
+
+	entries := al.Tunnels
+	if len(entries) > 0 {
+		if al.Server != "" || al.TunnelType != "" || len(al.Source) > 0 || len(al.Destination) > 0 {
+			return fmt.Errorf("alias %s has tunnels along with a server, type, source or destination of its own: move them into a tunnel", al.Name)
+		}
+	} else {
+		if al.Server == "" {
+			return fmt.Errorf("alias %s has neither a server nor tunnels to forward through", al.Name)
+		}
+
+		// flat aliases keep the CLI's ssh config when they leave it out.
+		entries = []alias.Tunnel{{
+			Server:    al.Server,
+			SshConfig: inherit(al.SshConfig, c.SshConfig),
+			Forwards:  []alias.Forward{{Type: al.TunnelType, Source: al.Source, Destination: al.Destination}},
+		}}
+	}
+
+	tunnels := make([]TunnelConfiguration, len(entries))
+	for i, at := range entries {
 		tc, err := mergeTunnel(al, at)
 		if err != nil {
-			return fmt.Errorf("tunnel %d of alias %s: %v", i+1, al.Name, err)
+			return fmt.Errorf("tunnel %d of alias %s: %w", i+1, al.Name, err)
 		}
-
-		if insecureGiven {
+		if fl.lookup("insecure") {
 			tc.Insecure = c.Insecure
 		}
-
 		tunnels[i] = *tc
 	}
 
-	c.Tunnels = tunnels
+	if len(al.Tunnels) > 0 {
+		c.Tunnels = tunnels
+	} else {
+		tc := tunnels[0]
+		c.Tunnels = nil
+		c.TunnelType = al.TunnelType
+		c.Server = tc.Server
+		c.Source = append(AddressInputList{}, tc.Forwards[0].Source...)
+		c.Destination = append(AddressInputList{}, tc.Forwards[0].Destination...)
+		c.Key = tc.Key
+		c.KeepAliveInterval = tc.KeepAliveInterval
+		c.ConnectionRetries = tc.ConnectionRetries
+		c.WaitAndRetry = tc.WaitAndRetry
+		c.SshAgent = tc.SshAgent
+		c.Timeout = tc.Timeout
+		c.SshConfig = tc.SshConfig
+		c.SocksAuth = tc.SocksAuth
+	}
 	c.Rpc = al.Rpc
 	c.RpcAddress = al.RpcAddress
 

@@ -313,100 +313,6 @@ func (c *Client) handleSignals() {
 	}
 }
 
-// Merge overwrites Configuration from the given Alias.
-//
-// Certain attributes like Verbose, Insecure and Detach will be overwritten
-// only if they are found on the givenFlags which should contain the name of
-// all flags given by the user through UI (e.g. CLI).
-func (c *Configuration) Merge(al *alias.Alias, givenFlags []string) error {
-	var fl flags = givenFlags
-
-	if !fl.lookup("verbose") {
-		c.Verbose = al.Verbose
-	}
-
-	if !fl.lookup("insecure") {
-		c.Insecure = al.Insecure
-	}
-
-	if !fl.lookup("detach") {
-		c.Detach = al.Detach
-	}
-
-	c.Id = al.Name
-
-	if len(al.Tunnels) > 0 {
-		return c.mergeTunnels(al, fl.lookup("insecure"))
-	}
-
-	if al.Server == "" {
-		return fmt.Errorf("alias %s has neither a server nor tunnels to forward through", al.Name)
-	}
-
-	c.TunnelType = al.TunnelType
-
-	srcl := AddressInputList{}
-	for _, src := range al.Source {
-		err := srcl.Set(src)
-		if err != nil {
-			return err
-		}
-	}
-	c.Source = srcl
-
-	dstl := AddressInputList{}
-	for _, dst := range al.Destination {
-		err := dstl.Set(dst)
-		if err != nil {
-			return err
-		}
-	}
-	c.Destination = dstl
-
-	srv := AddressInput{}
-	err := srv.Set(al.Server)
-	if err != nil {
-		return err
-	}
-	c.Server = srv
-
-	c.Key = al.Key
-
-	kai, err := time.ParseDuration(al.KeepAliveInterval)
-	if err != nil {
-		return err
-	}
-	c.KeepAliveInterval = kai
-
-	c.ConnectionRetries = al.ConnectionRetries
-
-	war, err := time.ParseDuration(al.WaitAndRetry)
-	if err != nil {
-		return err
-	}
-	c.WaitAndRetry = war
-
-	c.SshAgent = al.SshAgent
-
-	tim, err := time.ParseDuration(al.Timeout)
-	if err != nil {
-		return err
-	}
-	c.Timeout = tim
-
-	if al.SshConfig != "" {
-		c.SshConfig = al.SshConfig
-	}
-
-	c.SocksAuth = al.SocksAuth
-
-	c.Rpc = al.Rpc
-
-	c.RpcAddress = al.RpcAddress
-
-	return nil
-}
-
 // ShowInstances returns the runtime information about all instances of mole
 // running on the system with rpc enabled.
 func ShowInstances() (*InstancesRuntime, error) {
@@ -448,18 +354,6 @@ func ShowInstance(id string) (*Runtime, error) {
 	}
 
 	return &r, nil
-}
-
-type flags []string
-
-func (fs flags) lookup(flag string) bool {
-	for _, f := range fs {
-		if flag == f {
-			return true
-		}
-	}
-
-	return false
 }
 
 // createTunnels creates every tunnel the instance runs, one after the other so

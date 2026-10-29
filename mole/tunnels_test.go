@@ -141,6 +141,43 @@ func TestMergeTunnelsRejectsInvalidAliases(t *testing.T) {
 	}
 }
 
+func TestMergeRejectsInvalidForwardsInFlatAndNestedAliases(t *testing.T) {
+	for _, kind := range []string{"flat", "nested"} {
+		for _, forward := range []alias.Forward{
+			{Type: "locla", Source: []string{":8080"}, Destination: []string{"db:5432"}},
+			{Source: []string{":8080"}, Destination: []string{"db:5432"}},
+			{Type: "dynamic", Source: []string{":1080"}, Destination: []string{"db:5432"}},
+			{Type: "reverse-dynamic", Source: []string{":1080"}, Destination: []string{"db:5432"}},
+			{Type: "local", Source: []string{":8080"}, Destination: []string{"db"}},
+			{Type: "local", Source: []string{":8080"}},
+			{Type: "remote", Source: []string{":8080"}},
+		} {
+			t.Run(kind+"/"+forward.Type+"/"+strings.Join(forward.Destination, ","), func(t *testing.T) {
+				al := &alias.Alias{
+					Name:              "invalid-forward",
+					Detach:            true,
+					KeepAliveInterval: "10s",
+					WaitAndRetry:      "3s",
+					Timeout:           "3s",
+				}
+				if kind == "flat" {
+					al.Server = "mole@bastion-a"
+					al.TunnelType = forward.Type
+					al.Source = forward.Source
+					al.Destination = forward.Destination
+				} else {
+					al.Tunnels = []alias.Tunnel{{Server: "mole@bastion-a", Forwards: []alias.Forward{forward}}}
+				}
+
+				conf := &Configuration{}
+				if err := conf.Merge(al, nil); err == nil || !strings.Contains(err.Error(), "invalid-forward") {
+					t.Errorf("expected rejection before starting alias %s, got %v", al.Name, err)
+				}
+			})
+		}
+	}
+}
+
 // An alias that names no server at all, as one whose tunnels were all left out
 // does, has nothing to forward through, which is better told right away than
 // found out when connecting to a server with no address.
@@ -150,6 +187,47 @@ func TestMergeRejectsAliasesWithoutServer(t *testing.T) {
 	err := conf.Merge(&alias.Alias{Name: "nowhere", KeepAliveInterval: "10s", WaitAndRetry: "3s", Timeout: "3s"}, []string{})
 	if err == nil || !strings.Contains(err.Error(), "nowhere") {
 		t.Errorf("expected an error naming the alias without server, but got %v", err)
+	}
+}
+
+func TestMergeFlatAliasPreservesSettingsAndOverrides(t *testing.T) {
+	al := &alias.Alias{
+		Name:              "flat",
+		TunnelType:        "local",
+		Server:            "mole@bastion-a:2222",
+		Source:            []string{":8080"},
+		Destination:       []string{"db:5432"},
+		Key:               "path/to/key",
+		KeepAliveInterval: "10s",
+		ConnectionRetries: 0,
+		WaitAndRetry:      "3s",
+		SshAgent:          "$SSH_AUTH_SOCK",
+		Timeout:           "5s",
+		SocksAuth:         "$MOLE_SOCKS_AUTH",
+		Rpc:               true,
+		RpcAddress:        "127.0.0.1:0",
+	}
+	conf := &Configuration{
+		Verbose:   true,
+		Insecure:  true,
+		Detach:    true,
+		SshConfig: "path/to/config",
+		Tunnels:   []TunnelConfiguration{{Server: address(t, "mole@old-server")}},
+	}
+	if err := conf.Merge(al, []string{"verbose", "insecure", "detach"}); err != nil {
+		t.Fatalf("could not merge flat alias: %v", err)
+	}
+
+	expected := *al
+	expected.Verbose = true
+	expected.Insecure = true
+	expected.Detach = true
+	expected.SshConfig = "path/to/config"
+	if got := conf.ParseAlias("flat"); !reflect.DeepEqual(&expected, got) {
+		t.Errorf("flat settings changed: got %+v, want %+v", got, &expected)
+	}
+	if conf.Tunnels != nil {
+		t.Errorf("flat alias retained the previous tunnels: %+v", conf.Tunnels)
 	}
 }
 
