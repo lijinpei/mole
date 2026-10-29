@@ -91,6 +91,37 @@ func TestMethodWithError(t *testing.T) {
 	}
 }
 
+// A call given no params leaves them out of the request altogether, which is
+// how "mole show instances" asks an instance about itself, so the server has to
+// serve it rather than fall over on the params it was never sent.
+func TestMethodWithoutParams(t *testing.T) {
+	method := "testwithoutparams"
+	expectedResponse := `{"params":"null"}`
+
+	rpc.Register(method, func(params interface{}) (json.RawMessage, error) {
+		p, ok := params.([]uint8)
+		if !ok {
+			return nil, fmt.Errorf("invalid parameter")
+		}
+
+		return json.RawMessage(fmt.Sprintf(`{"params":%q}`, string(p))), nil
+	})
+
+	response, err := rpc.Call(context.Background(), addr.String(), method, nil)
+	if err != nil {
+		t.Fatalf("error while calling remote procedure: %v", err)
+	}
+
+	json, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("error while parsing response to string: response: %s, err: %v", response, err)
+	}
+
+	if expectedResponse != string(json) {
+		t.Errorf("unexpected response for remote procedure call: want: %s, got: %s", expectedResponse, string(json))
+	}
+}
+
 func TestMain(m *testing.M) {
 	var err error
 

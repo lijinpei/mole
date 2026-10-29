@@ -97,7 +97,17 @@ func (h *Handler) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2
 		return
 	}
 
-	params, err := req.Params.MarshalJSON()
+	// a request is allowed to leave its params out, which is how a client asks
+	// for a method that takes none, and how jsonrpc2 sends a call given no
+	// params at all. The methods are handed a null value for it, the same one
+	// they got back when clients sent a null instead of leaving them out.
+	reqParams := req.Params
+	if reqParams == nil {
+		null := json.RawMessage("null")
+		reqParams = &null
+	}
+
+	params, err := reqParams.MarshalJSON()
 	if err != nil {
 		log.WithFields(log.Fields{
 			"notification": req.Notif,

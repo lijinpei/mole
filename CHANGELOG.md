@@ -88,6 +88,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A destination address without a port no longer crashes `start`. The error
   was logged but not returned, so mole went on to start a tunnel that did not
   exist
+- `show instances` no longer crashes every instance it asks about. The rpc
+  client leaves the params of a call out of the request when there are none,
+  which the rpc server took for params it could read, bringing the whole
+  instance down along with its tunnel
 
 ### Changed
 - CI runs the build and the test suite on windows as well as linux
