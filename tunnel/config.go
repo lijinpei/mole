@@ -267,8 +267,15 @@ func (r SSHConfigFile) getKey(host string) string {
 	}
 
 	if id != "" {
+		// HOME is not where the home directory is kept everywhere: windows
+		// keeps it in USERPROFILE.
 		if strings.HasPrefix(id, "~") {
-			return filepath.Join(os.Getenv("HOME"), id[1:])
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return id
+			}
+
+			return filepath.Join(home, id[1:])
 		}
 
 		return id

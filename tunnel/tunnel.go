@@ -41,7 +41,8 @@ type Server struct {
 	// Insecure is a flag to indicate if the host keys should be validated.
 	Insecure bool
 	Timeout  time.Duration
-	// SSHAgent is the path to the unix socket where an ssh agent is listening
+	// SSHAgent is the path to the unix socket where an ssh agent is listening,
+	// or to the named pipe on windows.
 	SSHAgent string
 }
 
@@ -1207,7 +1208,7 @@ func (t *Tunnel) copyConn(channel *SSHChannel, client net.Addr, writer, reader n
 
 func getAgentSigners(addr string) ([]ssh.Signer, error) {
 	log.Debugf("ssh agent address: %s", addr)
-	conn, err := net.Dial("unix", addr)
+	conn, err := dialAgent(addr)
 	if err != nil {
 		return nil, err
 	}

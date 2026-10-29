@@ -310,6 +310,8 @@ sudo port selfupdate && sudo port install mole
 ## Windows
 
 * Download Mole for Windows from [here](https://github.com/davrodpin/mole/releases/latest)
+* The ssh agent of windows listens on a named pipe, which is given as
+  `--ssh-agent '\\.\pipe\openssh-ssh-agent'`
 
 # Usage
 

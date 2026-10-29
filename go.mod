@@ -16,6 +16,7 @@ require (
 	github.com/spf13/pflag v1.0.10
 	github.com/things-go/go-socks5 v0.1.1
 	golang.org/x/crypto v0.55.0
+	golang.org/x/sys v0.47.0
 	golang.org/x/term v0.45.0
 )
 
@@ -24,5 +25,4 @@ require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/kardianos/osext v0.0.0-20190222173326-2bc1f35cddc0 // indirect
 	github.com/sergi/go-diff v1.4.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 )

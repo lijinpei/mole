@@ -92,6 +92,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client leaves the params of a call out of the request when there are none,
   which the rpc server took for params it could read, bringing the whole
   instance down along with its tunnel
+- Ctrl-C stops an instance running in the foreground on windows, and `stop`
+  stops one. Both looked the instance up through a library that only does so
+  where it can detach a process, which leaves windows out, so the interrupt was
+  taken and logged as an error while the instance kept running
+- `--detach` works on windows. The library mole detaches an instance with only
+  does so where it can fork a process, so on windows the instance failed to
+  start instead. A detached instance is now a copy of mole started with no
+  console, which neither a ctrl-c nor closing the window it was started from
+  reaches, and `stop` kills it before removing its files, since windows does not
+  remove the log file it holds open
+- A key given as `IdentityFile ~/...` in the SSH config file is found on windows
+  when mole is run from cmd or powershell. The `~` was read from `HOME`, which
+  only shells such as git bash set there, so the key was looked for at the root
+  of the drive
+- `--ssh-agent` reaches the ssh agent of windows, which listens on a named pipe
+  (`\\.\pipe\openssh-ssh-agent`) rather than on a unix socket
 
 ### Changed
 - CI runs the build and the test suite on windows as well as linux

@@ -45,7 +45,8 @@ multiple -destination conf can be provided`)
 provide 0 to never give up or a negative number to disable`)
 	cmd.Flags().StringVarP(&conf.SshConfig, "config", "c", "$HOME/.ssh/config", "set config file path")
 	cmd.Flags().DurationVarP(&conf.WaitAndRetry, "retry-wait", "w", 3*time.Second, "time to wait before trying to reconnect to ssh server")
-	cmd.Flags().StringVarP(&conf.SshAgent, "ssh-agent", "A", "", "unix socket to communicate with a ssh agent")
+	cmd.Flags().StringVarP(&conf.SshAgent, "ssh-agent", "A", "", `unix socket to communicate with a ssh agent, or named pipe
+on windows (e.g. \\.\pipe\openssh-ssh-agent)`)
 	cmd.Flags().StringVarP(&conf.SocksAuth, "socks-auth", "", "", `require the clients of the socks5 proxy served by a dynamic
 or a reverse dynamic tunnel to authenticate with the given
 <user>:<password>. A value starting with $ names the

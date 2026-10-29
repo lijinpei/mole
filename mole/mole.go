@@ -230,38 +230,77 @@ func (c *Client) Stop() error {
 		return fmt.Errorf("no instance of mole with id %s is running", c.Conf.Id)
 	}
 
-	cntxt := &daemon.Context{
-		PidFileName: pfp,
-	}
-
-	d, err := cntxt.Search()
+	p, err := findInstanceProcess(pfp)
 	if err != nil {
 		return err
 	}
 
+	// an instance stopping itself, when it is interrupted, does not get past
+	// killing itself, so its files are removed first.
+	if p.Pid == os.Getpid() {
+		err = c.removeInstanceFiles(pfp)
+		if err != nil {
+			return err
+		}
+
+		return p.Kill()
+	}
+
+	// any other instance is gone before its files are removed, since windows
+	// refuses to remove a file a running process holds open, which a detached
+	// instance does with its log file.
+	err = p.Kill()
+	if err != nil {
+		return err
+	}
+
+	// waiting only works on windows, where it is needed: elsewhere the instance
+	// is not a child of this process, and its files can be removed while it is
+	// still going away.
+	p.Wait() //nolint: errcheck
+
+	return c.removeInstanceFiles(pfp)
+}
+
+// removeInstanceFiles removes the files kept about the instance: its pid file
+// when it is detached, and its whole directory otherwise.
+func (c *Client) removeInstanceFiles(pidFile string) error {
 	if c.Conf.Detach {
-		err = os.RemoveAll(pfp)
-		if err != nil {
-			return err
-		}
-	} else {
-		d, err := fsutils.InstanceDir(c.Conf.Id)
-		if err != nil {
-			return err
-		}
-
-		err = os.RemoveAll(d.Dir)
-		if err != nil {
-			return err
-		}
+		return os.RemoveAll(pidFile)
 	}
 
-	err = d.Kill()
+	d, err := fsutils.InstanceDir(c.Conf.Id)
 	if err != nil {
 		return err
 	}
 
-	return nil
+	return os.RemoveAll(d.Dir)
+}
+
+// findInstanceProcess returns the process whose pid is kept in the given pid
+// file, removing the file when that process is no longer running.
+//
+// go-daemon offers the same through Context.Search, but only on the systems it
+// can detach a process on, which leaves windows out. An instance running in
+// the foreground stops itself through here when it is interrupted, so the
+// lookup has to work everywhere.
+func findInstanceProcess(pidFile string) (*os.Process, error) {
+	pid, err := daemon.ReadPidFile(pidFile)
+	if err != nil {
+		return nil, err
+	}
+
+	running, err := processExists(pid)
+	if err != nil {
+		return nil, err
+	}
+
+	if !running {
+		os.Remove(pidFile)
+		return nil, fmt.Errorf("process %d from %s is not running", pid, pidFile)
+	}
+
+	return os.FindProcess(pid)
 }
 
 func (c *Client) handleSignals() {
@@ -409,51 +448,6 @@ func ShowInstance(id string) (*Runtime, error) {
 	}
 
 	return &r, nil
-}
-
-func startDaemonProcess(instanceConf *DetachedInstance) error {
-	args := appendIdArg(instanceConf.Id, os.Args)
-
-	cntxt := &daemon.Context{
-		PidFileName: instanceConf.PidFile,
-		PidFilePerm: 0644,
-		LogFileName: instanceConf.LogFile,
-		LogFilePerm: 0640,
-		Umask:       027,
-		Args:        args,
-	}
-
-	d, err := cntxt.Reborn()
-	if err != nil {
-		return err
-	}
-
-	if d != nil {
-		err = os.Rename(instanceConf.PidFile, instanceConf.PidFile)
-		if err != nil {
-			return err
-		}
-
-		err = os.Rename(instanceConf.LogFile, instanceConf.LogFile)
-		if err != nil {
-			return err
-		}
-
-		log.Infof("execute \"mole stop %s\" if you like to stop it at any time", instanceConf.Id)
-
-		os.Exit(0)
-	}
-
-	defer func() {
-		err := cntxt.Release()
-		if err != nil {
-			log.WithFields(log.Fields{
-				"id": instanceConf.Id,
-			}).WithError(err).Error("error detaching the mole instance")
-		}
-	}()
-
-	return nil
 }
 
 type flags []string

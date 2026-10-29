@@ -1,7 +1,10 @@
 package tunnel
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -160,5 +163,28 @@ Host example4
 		if value.DynamicForwards != nil {
 			t.Errorf("expected no dynamic forward to be read for host %s, but got %v", host, value.DynamicForwards)
 		}
+	}
+}
+
+// An IdentityFile starting with ~ names a file in the home directory of the
+// user, which windows keeps in USERPROFILE: HOME is only set there by shells
+// such as git bash, and not by cmd or powershell.
+func TestSSHConfigFileExpandsTheHomeDirectoryOfAKey(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Setenv("HOME", "")
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("could not find the home directory of the user: %v", err)
+	}
+
+	c, _ := ssh_config.Decode(strings.NewReader("Host example\n\tIdentityFile ~/.ssh/id_rsa\n"))
+	cfg := &SSHConfigFile{sshConfig: c}
+
+	expected := filepath.Join(home, ".ssh", "id_rsa")
+
+	if key := cfg.Get("example").Key; key != expected {
+		t.Errorf("unexpected key: expected: %s, value: %s", expected, key)
 	}
 }
